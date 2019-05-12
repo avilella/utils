@@ -30,7 +30,7 @@ if ($url =~ /http\w*\:\/\/github\.com\/(\S+)\/(\S+)/) {
 
 my $main = "/tmp/$owner.$repo.main.url";
 my $this_url = "http://github.com/$owner/$repo";
-$cmd = "wget -qO- \"$this_url\" > $main";
+$cmd = "wget -qO- \"$this_url\" | html2text > $main";
 print STDERR "# $cmd\n";
 $ret = `$cmd`;
 
@@ -38,14 +38,37 @@ open MAIN,"$main" or die $!;
 my $watchers = 0;
 my $starred  = 0;
 my $forked   = 0;
+my $commits  = 1;
+my $branches = 1;
+my $releases = 1;
+my $contributors = 1;
+
 while (<MAIN>) {
   my $line = $_; chomp $line;
-  if ($line =~ /(\d+) users are watching this repository/) {
+  if ($line =~ /\_commits/) {
+    print STDERR "# $line\n" if ($verbose);
+    $DB::single=1;1;
+  }
+  if ($line =~ /(\d+) user\w* are watching this repository/) {
     $watchers = $1;
-  } elsif ($line =~ /(\d+) users starred this repository/) {
+  } elsif ($line =~ /(\d+) user\w* starred this repository/) {
     $starred = $1;
-  } elsif ($line =~ /(\d+) users forked this repository/) {
+  } elsif ($line =~ /(\d+) user\w* forked this repository/) {
     $forked = $1;
+  } elsif ($line =~ /\_(\d+)\_\_commits/) {
+    $commits = $1;
+  } elsif ($line =~ /\_(\d+)\_\_branches/) {
+    $branches = $1;
+  } elsif ($line =~ /\_(\d+)\_\_releases/) {
+    $releases = $1;
+  } elsif ($line =~ /\_(\d+)\_\_contributors/) {
+    $contributors = $1;
+
+#    * __559__commits
+#      * __2__branches
+#      * __6__releases
+#      * __2__contributors
+#      
   }
 }
 close MAIN;
@@ -76,6 +99,8 @@ while (<LANG>) {
   }
 }
 close LANG;
-print "$watchers,$starred,$forked,". join(";",@langs) . "\n";
+
+
+print "$watchers,$starred,$forked,$commits,$branches,$releases,$contributors,". join(";",@langs) . "\n";
 $DB::single=1;1;#??
 $DB::single=1;1;
