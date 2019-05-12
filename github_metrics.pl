@@ -49,11 +49,15 @@ while (<MAIN>) {
     print STDERR "# $line\n" if ($verbose);
     $DB::single=1;1;
   }
-  if ($line =~ /(\d+) user\w* are watching this repository/) {
+#  * _Watch 7
+#    * _Star 38
+#    * _Fork 15
+    
+  if ($line =~ /\_Watch\s+(\d+)/) {
     $watchers = $1;
-  } elsif ($line =~ /(\d+) user\w* starred this repository/) {
+  } elsif ($line =~ /\_Star\s+(\d+)/) {
     $starred = $1;
-  } elsif ($line =~ /(\d+) user\w* forked this repository/) {
+  } elsif ($line =~ /\_Fork\s+(\d+)/) {
     $forked = $1;
   } elsif ($line =~ /\_(\d+)\_\_commits/) {
     $commits = $1;
