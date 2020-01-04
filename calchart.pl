@@ -41,6 +41,8 @@ while (<IN>) {
   next if ($date =~ /date/);
   next unless ($volume > 0);
   my ($day, $month, $year) = split('/',$date);
+  $month = sprintf("%d", $month);
+  $month = $month - 1;
   push @dates, "[ new Date($year, $month, $day), $volume ]";
 }
 
