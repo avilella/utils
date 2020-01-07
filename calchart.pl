@@ -7,9 +7,12 @@ use Getopt::Long;
 
 my $inputfile;
 my $debug; my $verbose;
+my $split = '/';
+
 GetOptions(
 	   'i|input|inputfile:s' => \$inputfile,
            'debug' => \$debug,
+           'split:s' => \$split,
           'verbose' => \$verbose,
           );
 
@@ -40,7 +43,7 @@ while (<IN>) {
   next unless (defined $date);
   next if ($date =~ /date/);
   next unless ($volume > 0);
-  my ($day, $month, $year) = split('/',$date);
+  my ($day, $month, $year) = split($split,$date);
   $month = sprintf("%d", $month);
   $month = $month - 1;
   push @dates, "[ new Date($year, $month, $day), $volume ]";
