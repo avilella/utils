@@ -55,7 +55,7 @@ my $status_id;
 my $doi;
 while(1) {
   $cmd = "find $dir -maxdepth 1 -mindepth 1 -name \"*$inputfile\" | xargs -r ls -t | head -n 1";
-  print STDERR "#$cmd\n";
+  print STDERR "#$cmd\n" if ($verbose);
   $ret = `$cmd`; chomp $ret;
   my $pdffile = $ret;
   if (defined($prev_preprint) && $pdffile ne $prev_preprint) {
@@ -68,17 +68,20 @@ while(1) {
     if ($ret =~ /(^.+https\:\/\/doi\..+)\./) {
       $doi = $1;
       $doi =~ s/preprint/\#preprint/;
+      $doi =~ s/The\ copyright.+//;
     }
 
     my $first = $nt->update("$doi");
     $status_id = $first->{id};
+    print STDERR "\n[$pdffile $status_id]\n";
     $prev_preprint = $pdffile;
+    print STDERR ".";
     sleep 10;
 
   } else {
 
     $cmd = "find $dir -name \"Screenshot_????????_??????.png\" | xargs -r ls -t 2>/dev/null | head -n 1";
-    print STDERR "#$cmd\n";
+    print STDERR "#$cmd\n" if ($verbose);
     $ret = `$cmd`; chomp $ret;
     my $filename = $ret;
     next unless (defined($filename) && (-s $filename));
@@ -89,10 +92,12 @@ while(1) {
       my $media = $nt->update_with_media({in_reply_to_status_id => $status_id, status => "$doi \@albertvilella", media => [undef, $filename, Content_Type => 'image/png', Content => $file_contents]});
 
       $status_id = $media->{id};
+      print STDERR "\n[$status_id]\n";
       $prev_image = $filename;
     }
   }
-  sleep 10;
+  print STDERR ".";
+  sleep 2;
 }
 
 1;
