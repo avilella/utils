@@ -65,11 +65,16 @@ while(1) {
     $ret = `$cmd`; chomp $ret;
     $cmd = "grep doi $txtfile";
     $ret = `$cmd`; chomp $ret;
-    if ($ret =~ /(^.+https\:\/\/doi\..+)\./) {
+    if ($ret =~ /doi\:\ 10\./) {
+      $ret =~ s|doi\:\ 10\.|doi\:\ https://doi.org/10\.|;
+    }
+    $DB::single=1;1;#??
+    if ($ret =~ /(^.+https\:\/\/doi\..+)[\.\n]/) {
       $doi = $1;
       $doi =~ s/preprint/\#preprint/;
       $doi =~ s/The\ copyright.+//;
     }
+    $DB::single=1;1;#??
 
     my $first = $nt->update("$doi");
     $status_id = $first->{id};
