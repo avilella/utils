@@ -65,7 +65,7 @@ while(1) {
     $ret = `$cmd`; chomp $ret;
     $cmd = "grep doi $txtfile";
     $ret = `$cmd`; chomp $ret;
-    $DB::single=1;1;#??
+    # $DB::single=1;1;
     # Bioinformatics Oupjournals
     if ($ret =~ /Downloaded from https:\/\/academic.oup.com\/bioinformatics\/article-abstract\/doi/) {
       $ret =~ s/Downloaded from https:\/\/academic.oup.com\/bioinformatics\/article-abstract\/doi/#oupjournals #bioinformatics doi\: https:\/\/doi.org\//;
@@ -73,7 +73,7 @@ while(1) {
     } elsif ($ret =~ /doi\:\ 10\./) {
       $ret =~ s|doi\:\ 10\.|doi\:\ https://doi.org/10\.|;
     }
-    $DB::single=1;1;#??
+    # $DB::single=1;1;
     # biorxiv medrxiv
     if ($ret =~ /(^.+https\:\/\/doi\..+)[\.\n]/) {
       $doi = $1;
@@ -81,21 +81,32 @@ while(1) {
       $doi =~ s/The\ copyright.+//;
       $doi =~ s/^(.+\/bioinformatics\/btaa\d+)\/.+/$1/;
     }
-    $DB::single=1;1;#??
-
-    # $cmd = "grep -i keyword $txtfile";
-    # $ret = `$cmd`; chomp $ret;
     # $DB::single=1;1;#??
 
+    $cmd = "grep -A1 -i -e keyword -e 'key word' $txtfile";
+    $ret = `$cmd`; chomp $ret; $ret =~ s/key words\:|keyword[s]\:\s+//i;
+    chomp $ret;
+    my @keyw = split(/\,|\;/,$ret);
+    $DB::single=1;1;#??
+
     my $pngfile = $txtfile; $pngfile =~ s/\.txt/\.png/;
-    $cmd = "cat $txtfile | wordcloud_cli --imagefile $pngfile --stopwords /media/sf_Downloads/stop-words/stop-words-english1.txt 2>/dev/null | csvtk sort -H -k 2:rn | head -n 10 | csvtk cut -f 1";
+    $cmd = "cat $txtfile | wordcloud_cli --imagefile $pngfile --stopwords $ENV{HOME}/utils/stop-words-twitter.txt 2>/dev/null | csvtk sort -H -k 2:rn | head -n 10 | csvtk cut -f 1";
     print STDERR "#$cmd\n";
     $ret = `$cmd`; chomp $ret;
     my @keywords = split("\n",$ret);
     my $str_keywords;
-    foreach my $word (@keywords) {
+    foreach my $word (@keywords,@keyw) {
       $word =~ s/\-/\_/g;
       $word =~ s/\s/\_/g;
+
+      my $tword = qr{ \w [\w'-]* }x;
+      my $tnonword = qr{ [^\w'-]+ }x;
+      $word =~ s{
+		  \b
+		  ($tword)
+		  (?: $tnonword \1 )+
+		  (?! \w )  # UPDATE
+	      }{$1}xg;
       $str_keywords .= "#$word ";
     }
 
