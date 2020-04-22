@@ -650,3 +650,40 @@ peer
 NC
 holder
 Figure
+number
+read
+Fig
+reserved
+permission
+based
+word
+et al
+doi org
+org copyright
+cell
+copyright holder
+peer reviewed
+reviewed author
+preprint peer
+holder preprint
+using
+https doi
+gene
+doi https
+data
+author funder
+made available
+Fig
+bioRxiv preprint
+preprint doi
+funder rights
+used
+rights reserved
+reserved reuse
+ND International
+dataset
+sample
+funder made
+allowed without
+reuse allowed
+International license
