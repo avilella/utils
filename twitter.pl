@@ -60,7 +60,7 @@ while(1) {
   my $pdffile = $ret;
   if (defined($prev_preprint) && $pdffile ne $prev_preprint) {
     my $txtfile = $pdffile;
-    $txtfile =~ s/\.pdf/\.txt/;
+    $txtfile =~ s/\.pdf/\.txt/i;
     $cmd = "pdftotext $pdffile";
     $ret = `$cmd`; chomp $ret;
     $cmd = "grep doi $txtfile";
@@ -87,15 +87,16 @@ while(1) {
     $ret = `$cmd`; chomp $ret; $ret =~ s/key words\:|keyword[s]\:\s+//i;
     chomp $ret;
     my @keyw = split(/\,|\;/,$ret);
-    $DB::single=1;1;#??
+    # $DB::single=1;1;
 
     my $pngfile = $txtfile; $pngfile =~ s/\.txt/\.png/;
-    $cmd = "cat $txtfile | wordcloud_cli --imagefile $pngfile --stopwords $ENV{HOME}/utils/stop-words-twitter.txt 2>/dev/null | csvtk sort -H -k 2:rn | head -n 10 | csvtk cut -f 1";
+    $cmd = "cat $txtfile | python3 /usr/local/bin/wordcloud_cli --imagefile $pngfile --stopwords $ENV{HOME}/utils/stop-words-twitter.txt 2>/dev/null | csvtk sort -H -k 2:rn | head -n 10 | csvtk cut -f 1";
     print STDERR "#$cmd\n";
     $ret = `$cmd`; chomp $ret;
     my @keywords = split("\n",$ret);
-    my $str_keywords;
+    my $str_keywords = '';
     foreach my $word (@keywords,@keyw) {
+      $word =~ s/^\s+//;
       $word =~ s/\-/\_/g;
       $word =~ s/\s/\_/g;
 
@@ -109,10 +110,35 @@ while(1) {
 	      }{$1}xg;
       $str_keywords .= "#$word ";
     }
+    # Arxiv
+    $DB::single=1;1;#??
+    if (!defined $doi) {
+      $cmd = "grep -i arxiv $txtfile";
+      print STDERR "#$cmd\n";
+      $ret = `$cmd`; chomp $ret;
+      $doi = "."; $doi .= $ret; $doi =~ s/\n/\ \|\ /g;
+      $doi =~ s/arXiv\:(\d+)/https\:\/\/arxiv\.org\/abs\/$1/;
+      $doi =~ s/\.http/http/;
+      $DB::single=1;1;#??
+    }
 
+    # Mobile Tweet saved as pdf
+    if (!defined $doi) {
+      $cmd = "grep -e '\@' -e http $txtfile";
+      print STDERR "#$cmd\n";
+      $ret = `$cmd`; chomp $ret;
+      $doi = "."; $doi .= $ret; $doi =~ s/\n/\ \|\ /g;
+      $doi =~ s/\s+\w+\@\w+\.\w+\s+/\ /g;
+      $doi =~ s/\s+\w+\.\w+\@\w+\.\w+\s+/\ /g;
+      $doi =~ s/\.\w+\@\w+\.\w+\s+/\ /g;
+      $doi =~ s/\.\w+\@\w+\.\w+\.\w+\s+/\ /g;
+      $doi =~ s/Correspondence\://;
+      $doi =~ s/^(.{300}).*/$1/;
+      print STDERR "[$doi]";
+    }
+    print STDERR "\n[$doi $str_keywords]\n";
     my $first = $nt->update("$doi $str_keywords");
     $status_id = $first->{id};
-    print STDERR "\n[$doi $str_keywords]\n";
     print STDERR "\n[$pdffile $status_id]\n";
     $prev_preprint = $pdffile;
     print STDERR ".";
@@ -147,5 +173,7 @@ while(1) {
   print STDERR ".";
   sleep 2;
 }
+
+$DB::single=1;1;#??
 
 1;
