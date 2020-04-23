@@ -52,12 +52,19 @@ my $prev_preprint = 1;
 my $prev_image    = 1;
 my $status_id;
 
+my $image_count = 0;
+my $has_doi_shot = 0;
+
 my $doi; my $keywords;
 while(1) {
   $cmd = "find $dir -maxdepth 1 -mindepth 1 -name \"*$inputfile\" | xargs -r ls -t | head -n 1";
   print STDERR "#$cmd\n" if ($verbose);
   $ret = `$cmd`; chomp $ret;
   my $pdffile = $ret;
+  $cmd = 'stat -c %y ' . $pdffile;
+  # print STDERR "#$cmd\n";
+  $ret = `$cmd`; chomp $ret;
+  my $pdftimestamp = $ret;
   if (defined($prev_preprint) && $pdffile ne $prev_preprint) {
     my $txtfile = $pdffile;
     $txtfile =~ s/\.pdf/\.txt/i;
@@ -90,7 +97,7 @@ while(1) {
     # $DB::single=1;1;
 
     my $pngfile = $txtfile; $pngfile =~ s/\.txt/\.png/;
-    $cmd = "cat $txtfile | python3 /usr/local/bin/wordcloud_cli --imagefile $pngfile --stopwords $ENV{HOME}/utils/stop-words-twitter.txt 2>/dev/null | csvtk sort -H -k 2:rn | head -n 10 | csvtk cut -f 1";
+    $cmd = "cat $txtfile | python3 /usr/local/bin/wordcloud_cli --imagefile $pngfile --stopwords $ENV{HOME}/utils/stop-words-twitter.txt 2>/dev/null | csvtk sort -H -k 2:rn 2>/dev/null | head -n 10 | csvtk cut -f 1 2>/dev/null";
     print STDERR "#$cmd\n";
     $ret = `$cmd`; chomp $ret;
     my @keywords = split("\n",$ret);
@@ -111,7 +118,7 @@ while(1) {
       $str_keywords .= "#$word ";
     }
     # Arxiv
-    $DB::single=1;1;#??
+    # $DB::single=1;1;#??
     if (!defined $doi) {
       $cmd = "grep -i arxiv $txtfile";
       print STDERR "#$cmd\n";
@@ -119,6 +126,20 @@ while(1) {
       $doi = "."; $doi .= $ret; $doi =~ s/\n/\ \|\ /g;
       $doi =~ s/arXiv\:(\d+)/https\:\/\/arxiv\.org\/abs\/$1/;
       $doi =~ s/\.http/http/;
+      $doi = undef if $doi eq '.';
+    }
+
+    # github page
+    if (!defined $doi) {
+      $cmd = "grep -e '\ www\.github\.com' $txtfile";
+      print STDERR "#$cmd\n";
+      $ret = `$cmd`; chomp $ret;
+      $doi = "#github \@github " . $ret;
+      $doi =~ s/\.$//;
+      $doi =~ s/Download the latest version and accompanying files from//;
+      do {
+	$doi =~ s/\s+(\w+)\s+/\ \#$1\ /g;
+      } while ($doi =~ /\s+\w+\s+/);
       $DB::single=1;1;#??
     }
 
@@ -133,11 +154,16 @@ while(1) {
       $doi =~ s/\.\w+\@\w+\.\w+\s+/\ /g;
       $doi =~ s/\.\w+\@\w+\.\w+\.\w+\s+/\ /g;
       $doi =~ s/Correspondence\://;
-      $doi =~ s/^(.{300}).*/$1/;
       print STDERR "[$doi]";
     }
-    print STDERR "\n[$doi $str_keywords]\n";
-    my $first = $nt->update("$doi $str_keywords");
+    my $compose = "$doi $str_keywords";
+    if (length($compose) > 240) {
+      print STDERR "# Shorten:\n";
+      $compose =~ s/^(.{240}).*/$1/;
+    }
+    print STDERR "\n[$compose]\n";
+    my $first = $nt->update("$compose");
+    $image_count = 0;
     $status_id = $first->{id};
     print STDERR "\n[$pdffile $status_id]\n";
     $prev_preprint = $pdffile;
@@ -158,7 +184,26 @@ while(1) {
     print STDERR "#$cmd\n" if ($verbose);
     $ret = `$cmd`; chomp $ret;
     my $filename = $ret;
+
+    $cmd = 'stat -c %y ' . $filename;
+    # print STDERR "#$cmd\n";
+    $ret = `$cmd`; chomp $ret;
+    my $shottimestamp = $ret;
+    my @x = sort($pdftimestamp,$shottimestamp);
+    if ($x[0] eq $pdftimestamp) {
+      $DB::single=1;1;#??
+    }
     next unless (defined($filename) && (-s $filename));
+
+    $cmd = "gocr -i $filename | tail -n 1 | grep '^doi\:'";
+    # print STDERR "#$cmd\n";
+    eval { $ret = `$cmd` ; }; chomp $ret;
+    my $grepshot = $ret;
+    if ($grepshot =~ /^doi\:/ && $image_count > 0 && 1 == $has_doi_shot) {
+      # this is the first image of a pdf we haven't analysed yet, so skip
+      # $prev_image = $filename;
+      next;
+    }
 
     if (defined($prev_image) && $filename ne $prev_image) {
 
@@ -166,6 +211,8 @@ while(1) {
       my $media = $nt->update_with_media({in_reply_to_status_id => $status_id, status => "$doi \@albertvilella", media => [undef, $filename, Content_Type => 'image/png', Content => $file_contents]});
 
       $status_id = $media->{id};
+      $has_doi_shot = 1 if ($grepshot =~ /^doi\:/);
+      $image_count++;
       print STDERR "\n[$status_id]\n";
       $prev_image = $filename;
     }
