@@ -1,6 +1,5 @@
 # Instructions below on how to add to Linux bash
-# curl -s -o ~/.csvtk_aliases https://raw.githubusercontent.com/avilella/utils/refs/heads/master/csvtk_aliases
-# echo 'source ~/.csvtk_aliases' >> ~/.bashrc
+# curl -s -o ~/.csvtk_aliases https://raw.githubusercontent.com/avilella/utils/refs/heads/master/csvtk_aliases && echo 'source ~/.csvtk_aliases' >> ~/.bashrc
 
 alias mutrept="csvtk mutate2 -t -n idx -e \"'1'\" | csvtk replace -t -f idx -p '.+' -r '{nr}'"
 alias mutrep="csvtk mutate2 -n idx -e \"'1'\" | csvtk replace -f idx -p '.+' -r '{nr}'"
