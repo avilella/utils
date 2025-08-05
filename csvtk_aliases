@@ -1,0 +1,9 @@
+alias mutrept="csvtk mutate2 -t -n idx -e \"'1'\" | csvtk replace -t -f idx -p '.+' -r '{nr}'"
+alias mutrep="csvtk mutate2 -n idx -e \"'1'\" | csvtk replace -f idx -p '.+' -r '{nr}'"
+alias ct="csvtk transpose";
+alias ctt="csvtk transpose -t";
+alias prt="csvtk pretty -n 999999";
+alias prth="csvtk pretty -n 999999 -H";
+alias prtt="csvtk pretty -n 999999 -t";
+alias prtth="csvtk pretty -n 999999 -t -H";
+alias noemptycols=" csvtk transpose | csvtk grep -H -f 2- -r -p . | csvtk transpose"
