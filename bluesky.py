@@ -150,6 +150,15 @@ def main():
     follows = get_all_follows(args.service, access, confirmed_handle, args.limit)
     print(f"Found {len(follows)} accounts you follow.\n")
 
+    # If --nodesc is enabled, process empties first by reordering:
+    if args.nodesc:
+        def _combined_text(f):
+            desc = (f.get("description") or "").strip()
+            bio = (f.get("bio") or ((f.get("profile") or {}).get("description") or "")).strip()
+            return (" ".join([s for s in (bio, desc) if s])).strip()
+        # Stable sort: empties (no bio+desc) first; others keep relative order
+        follows.sort(key=lambda f: 0 if not _combined_text(f) else 1)
+
     # Iterate and filter by keywords in bio + description
     kept, candidates, empties = 0, 0, 0
     for f in follows:
