@@ -56,34 +56,118 @@ def get_session(service, identifier, password):
         raise RuntimeError("Login succeeded but did not return accessJwt and/or did")
     return access, did, handle
 
-def get_all_follows(service, access_jwt, actor_handle, total_limit=100, page_size=100, max_pages=100):
+import sys
+
+def get_all_follows(service, access_jwt, actor_handle,
+                    total_limit=100, page_size=100, max_pages=100,
+                    nodesc=False):
     """
-    Fetch up to `total_limit` follows (who actor_handle is following).
+    If nodesc=False:
+      - Fetch up to `total_limit` follows, paging with `page_size`.
+    If nodesc=True:
+      - Treat `page_size` as the *batch size* per request (use --limit to set it).
+      - Keep paging until we've scanned ALL follows (or hit max_pages),
+        and return ONLY accounts whose 'description' is empty or missing.
+      - Prints a '.' to stderr every 100 accounts processed for progress feedback.
     """
     base_url = f"{service}/xrpc/app.bsky.graph.getFollows"
     headers = {"Authorization": f"Bearer {access_jwt}"}
-    follows, seen = [], set()
-    cursor = None
-    pages, fetched = 0, 0
 
-    while fetched < total_limit and pages < max_pages:
-        limit = min(page_size, total_limit - fetched)
+    results = []
+    seen = set()
+    cursor = None
+    pages = 0
+    fetched_total = 0  # total processed, not just matches
+
+    while pages < max_pages:
+        # Determine how many to ask for this page
+        if nodesc:
+            limit = page_size  # --limit = batch size
+        else:
+            if fetched_total >= total_limit:
+                break
+            limit = min(page_size, total_limit - fetched_total)
+
         q = f"?actor={actor_handle}&limit={limit}"
-        if cursor: q += f"&cursor={cursor}"
+        if cursor:
+            q += f"&cursor={cursor}"
+
         out = run_curl("GET", base_url + q, headers=headers)
         batch = out.get("follows", []) or []
         new_cursor = out.get("cursor")
-        if not batch: break
+
+        if not batch:
+            break
+
+        pages += 1
+        cursor_unchanged = (new_cursor == cursor)
+        cursor = new_cursor
+
         for item in batch:
             key = item.get("did") or item.get("handle")
-            if key in seen: continue
-            follows.append(item); seen.add(key)
-            fetched += 1
-            if fetched >= total_limit: break
+            if key in seen:
+                continue
+            seen.add(key)
+            fetched_total += 1
+
+            # progress dot every 100 accounts in --nodesc mode
+            if nodesc and fetched_total % 100 == 0:
+                sys.stderr.write(".")
+                sys.stderr.flush()
+
+            if nodesc:
+                desc = (item.get("description") or "").strip()
+                if desc == "":
+                    results.append(item)
+            else:
+                results.append(item)
+                if fetched_total >= total_limit:
+                    break
+
+        if not cursor or cursor_unchanged:
+            break
+        if not nodesc and fetched_total >= total_limit:
+            break
+
+    if nodesc:
+        sys.stderr.write("\n")  # newline after progress dots
+        sys.stderr.flush()
+
+    return results
+
+def get_following_set(service, access_jwt, actor_handle, page_size=100, max_pages=1000):
+    """
+    Returns a set of DIDs that you (actor_handle) already follow.
+    """
+    base_url = f"{service}/xrpc/app.bsky.graph.getFollows"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+
+    dids = set()
+    cursor = None
+    pages = 0
+
+    while pages < max_pages:
+        q = f"?actor={actor_handle}&limit={page_size}"
+        if cursor:
+            q += f"&cursor={cursor}"
+
+        out = run_curl("GET", base_url + q, headers=headers)
+        batch = out.get("follows", []) or []
+        if not batch:
+            break
+
+        for it in batch:
+            if it.get("did"):
+                dids.add(it["did"])
+
+        cursor_new = out.get("cursor")
         pages += 1
-        if not new_cursor or new_cursor == cursor: break
-        cursor = new_cursor
-    return follows
+        if not cursor_new or cursor_new == cursor:
+            break
+        cursor = cursor_new
+
+    return dids
+
 
 def get_followers(service, access_jwt, actor, total_limit=100, page_size=100, max_pages=100):
     """
@@ -402,17 +486,33 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
 
         for f in followers:
             f_key = key_of(f)
-            if not f_key or f_key in already_following:
+            if not f_key:
                 continue
-
+            # Skip yourself
+            if f_key == did:
+                continue
+            # Skip if already following (local set) or server reports a follow
+            if f_key in already_following or (f.get("viewer") or {}).get("following"):
+                continue
+ 
             f_text, f_ok = text_matches(f)
             if not f_ok:
                 continue
-
+ 
             # Avoid showing the same candidate multiple times from different seeds
             if f_key in seen_candidates:
                 continue
             seen_candidates.add(f_key)
+
+            f_key = key_of(f)
+            if not f_key:
+                continue
+            # Skip yourself
+            if f_key == did:
+                continue
+            # Skip if already following (local set) or server reports a follow
+            if f_key in already_following or (f.get("viewer") or {}).get("following"):
+                continue
 
             display = f.get("displayName") or f.get("handle") or f.get("did") or "<unknown>"
             handle_or_did = f.get("handle") or f.get("did") or "<unknown>"
@@ -468,8 +568,11 @@ def main():
     ap.add_argument("--degreelimit", type=int, default=100,
                     help="For degreesearch: maximum DEPTH (levels) to explore from your seeds (min 1).")
     ap.add_argument("--dry-run", action="store_true", help="Don’t actually change follows; just show what would happen")
-    ap.add_argument("--nodesc", action="store_true",
-                    help="(following mode only) Auto-unfollow accounts with empty bio/description first (no prompt; combine with --dry-run).")
+    ap.add_argument(
+        "--nodesc",
+        action="store_true",
+        help="Scan ALL follows and return only accounts with empty/missing description. In this mode, --limit is the per-page batch size."
+    )
     args = ap.parse_args()
 
     handle, app_password = read_creds(Path(args.creds))
@@ -480,6 +583,30 @@ def main():
     print(f"Logging in as {handle} @ {args.service} ...")
     access, did, confirmed_handle = get_session(args.service, handle, app_password)
     print(f"OK. DID: {did}  Handle: {confirmed_handle}")
+
+    if args.nodesc:
+        # --limit is the *batch size* per page; scan ALL follows and only return no-desc accounts
+        follows = get_all_follows(
+            service=args.service,
+            access_jwt=access,
+            actor_handle=confirmed_handle,
+            total_limit=10**12,      # ignored in nodesc mode
+            page_size=max(1, args.limit),  # treat --limit as batch size
+            max_pages=10000,         # generous fuse
+            nodesc=True
+        )
+    else:
+        # --limit is the *total* number of follows to fetch
+        follows = get_all_follows(
+            service=args.service,
+            access_jwt=access,
+            actor_handle=confirmed_handle,
+            total_limit=args.limit,
+            page_size=100,           # efficient page size
+            max_pages=1000,
+            nodesc=False
+        )
+
 
     if args.mode == "following":
         mode_following(args, args.service, access, did, confirmed_handle, keywords)
