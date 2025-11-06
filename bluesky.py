@@ -133,6 +133,8 @@ def main():
     ap.add_argument("--service", default="https://bsky.social", help="PDS base URL (default: https://bsky.social)")
     ap.add_argument("--limit", type=int, default=100, help="Page size for getFollows (max ~100)")
     ap.add_argument("--dry-run", action="store_true", help="Don’t actually unfollow; just show what would happen")
+    ap.add_argument("--nodesc", action="store_true",
+                    help="Automatically unfollow accounts with an empty bio/description (no prompt; combine with --dry-run to preview)")
     args = ap.parse_args()
 
     handle, app_password = read_creds(Path(args.creds))
@@ -149,12 +151,32 @@ def main():
     print(f"Found {len(follows)} accounts you follow.\n")
 
     # Iterate and filter by keywords in description
-    kept, candidates = 0, 0
+    kept, candidates, empties = 0, 0, 0
     for f in follows:
         actor = f.get("handle") or f.get("did") or "<unknown>"
         display = f.get("displayName") or actor
         desc = (f.get("description") or "").strip()
         desc_lc = desc.lower()
+
+        # NEW: auto-remove empty descriptions if requested
+        if args.nodesc and not desc:
+            follow_uri = (f.get("viewer") or {}).get("following")
+            print("=" * 72)
+            print(f"{display}  (@{actor})")
+            print("Bio: (no description)")
+            if not follow_uri:
+                print("Warning: No follow record URI available (cannot auto-unfollow from here).")
+            else:
+                if args.dry_run:
+                    print(f"[dry-run] Would unfollow (empty description) via record {follow_uri}")
+                else:
+                    try:
+                        delete_follow_record(args.service, access, did, follow_uri)
+                        print("Unfollowed (empty description).")
+                    except Exception as e:
+                        print(f"Failed to unfollow: {e}")
+            empties += 1
+            continue  # skip keyword checks & prompts
 
         match = any(kw in desc_lc for kw in keywords) if keywords else False
 
@@ -193,6 +215,8 @@ def main():
     print("\nDone.")
     print(f"Kept (keyword matched): {kept}")
     print(f"Reviewed without match: {candidates}")
+    if args.nodesc:
+        print(f"Removed (empty description): {empties}")
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
 
