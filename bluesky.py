@@ -323,17 +323,18 @@ def mode_searching(args, service, access, did, handle, keywords):
 
 def mode_degreesearch(args, service, access, did, handle, keywords):
     """
-    New behavior (iterative exploration):
-      1) Fetch up to --limit of *my follows* (degree 0 seeds).
-      2) For each seed, if its bio/description matches any keyword:
-         a) fetch that seed's followers (degree 1) up to --limit,
-         b) for each follower whose bio/description matches:
-            - prompt to follow,
-            - on 'y', follow (or simulate in --dry-run),
-            - add that newly-followed account to the queue of seeds to expand next.
-      3) Repeat 2) for newly-followed accounts until we have added --degreelimit accounts,
-         or we run out of candidates.
+    Depth-based exploration:
+      - Seeds: up to --limit of *my follows* (degree 0).
+      - For each seed that matches any keyword (bio/description):
+          fetch up to --limit of its followers (degree + 1).
+          For each follower that matches, prompt to follow.
+          If accepted, enqueue that account as a new seed with depth+1.
+      - Continue breadth-first until the queue is exhausted or we reach
+        the maximum DEPTH (--degreelimit). The number of accepted follows
+        does NOT stop the exploration; it only affects breadth of enqueued seeds.
     """
+    from collections import deque
+
     def combine_bio_desc(obj):
         desc = (obj.get("description") or "").strip()
         bio = (obj.get("bio") or ((obj.get("profile") or {}).get("description") or "")).strip()
@@ -343,9 +344,13 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
         txt = combine_bio_desc(obj)
         return txt, (txt and any(kw in txt.lower() for kw in keywords))
 
-    # Load up to --limit of my current follows (degree 0 seed list)
+    # Normalize degreelimit to a minimum of 1 (seed -> followers)
+    max_depth = max(1, int(args.degreelimit))
+
+    # Load up to --limit of my current follows (degree 0 seeds)
     base_seeds = get_all_follows(service, access, handle, total_limit=max(1, args.limit))
     print(f"Loaded {len(base_seeds)} of your follows (seed candidates, capped by --limit={args.limit}).")
+    print(f"Exploring up to depth (--degreelimit) = {max_depth}.")
 
     # Build set of accounts I'm already following (by did/handle) to avoid re-suggesting
     already_following = set()
@@ -354,48 +359,48 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
         if key:
             already_following.add(key)
 
-    # The queue of seeds to expand (start with the base seeds)
-    # We'll expand only seeds whose bio/description matches a keyword.
-    from collections import deque
-    queue = deque(base_seeds)
-    visited_seeds = set()  # did/handle keys we've expanded as seeds
-    added = 0              # new follows in this session
+    # Queue of (actor_obj, depth). Start with seeds at depth 0.
+    queue = deque((seed, 0) for seed in base_seeds)
+    visited_seeds = set()       # which actors we've expanded as seeds
+    seen_candidates = set()     # suggestions we've already shown
+    added = 0
     skipped = 0
 
-    # Helper to normalize an object key
     def key_of(obj):
         return obj.get("did") or obj.get("handle")
 
-    # Exploration loop
-    while queue and added < max(1, args.degreelimit):
-        seed = queue.popleft()
+    while queue:
+        seed, depth = queue.popleft()
         seed_key = key_of(seed)
         if not seed_key or seed_key in visited_seeds:
             continue
         visited_seeds.add(seed_key)
 
+        # Only expand seeds that match keywords
         seed_text, seed_ok = text_matches(seed)
         if not seed_ok:
-            continue  # only expand seeds with keyword match
+            continue
 
         seed_handle_or_did = seed.get("handle") or seed.get("did") or "<unknown>"
         print("=" * 72)
-        print(f"Expanding seed: {seed.get('displayName') or seed_handle_or_did} (@{seed_handle_or_did})")
+        print(f"Depth {depth} seed: {seed.get('displayName') or seed_handle_or_did} (@{seed_handle_or_did})")
         print(f"Bio/Description: {seed_text if seed_text else '(no description)'}")
 
-        # Fetch followers of the seed, capped by --limit
+        # If we've reached max depth, do not expand further
+        if depth >= max_depth:
+            print(f"(Reached max depth for this branch; not expanding followers.)")
+            continue
+
+        # Fetch followers of this seed (next depth level)
         followers = get_followers(
             service, access, seed_handle_or_did,
             total_limit=max(1, args.limit),
             page_size=min(50, max(1, args.limit)),
             max_pages=max(1, (max(1, args.limit) + 49)//50)
         )
-        print(f"  Found {len(followers)} followers to review (capped by --limit={args.limit}).")
+        print(f"  Found {len(followers)} followers to review at depth {depth+1} (capped by --limit={args.limit}).")
 
-        # For each follower: if matches keywords and not already following, propose to follow
         for f in followers:
-            if added >= max(1, args.degreelimit):
-                break
             f_key = key_of(f)
             if not f_key or f_key in already_following:
                 continue
@@ -404,10 +409,15 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
             if not f_ok:
                 continue
 
+            # Avoid showing the same candidate multiple times from different seeds
+            if f_key in seen_candidates:
+                continue
+            seen_candidates.add(f_key)
+
             display = f.get("displayName") or f.get("handle") or f.get("did") or "<unknown>"
             handle_or_did = f.get("handle") or f.get("did") or "<unknown>"
             print("-" * 72)
-            print(f"Candidate: {display}  (@{handle_or_did})  — follower of seed above")
+            print(f"Candidate (depth {depth+1}): {display}  (@{handle_or_did})  — follower of seed above")
             print(f"Bio/Description: {f_text if f_text else '(no description)'}")
             print("Follow this account? [y/N]: ", end="", flush=True)
             choice = sys.stdin.readline().strip().lower()
@@ -418,8 +428,9 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
                 if args.dry_run:
                     print("[dry-run] Would follow (create record).")
                     added += 1
-                    # enqueue this as a new seed for expansion
-                    queue.append(f)
+                    # Enqueue as a new seed to expand further if within depth budget
+                    if depth + 1 <= max_depth - 1:
+                        queue.append((f, depth + 1))
                 else:
                     try:
                         subject_did = f.get("did")
@@ -430,8 +441,8 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
                         create_follow_record(service, access, did, subject_did)
                         print("Followed.")
                         added += 1
-                        # enqueue this as a new seed for expansion
-                        queue.append(f)
+                        if depth + 1 <= max_depth - 1:
+                            queue.append((f, depth + 1))
                     except Exception as e:
                         print(f"Failed to follow: {e}")
                         skipped += 1
@@ -440,7 +451,7 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
                 print("Skipped.")
 
     print("\nDone.")
-    print(f"New follows added this session: {added} (target --degreelimit={args.degreelimit})")
+    print(f"New follows added this session: {added}")
     print(f"Skipped: {skipped}")
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
@@ -455,7 +466,7 @@ def main():
     ap.add_argument("--service", default="https://bsky.social", help="PDS base URL (default: https://bsky.social)")
     ap.add_argument("--limit", type=int, default=100, help="For following/searching: page-size/limit used in those modes.")
     ap.add_argument("--degreelimit", type=int, default=100,
-                    help="For degreesearch: max degree-0 seeds to inspect AND per-seed followers fetched.")
+                    help="For degreesearch: maximum DEPTH (levels) to explore from your seeds (min 1).")
     ap.add_argument("--dry-run", action="store_true", help="Don’t actually change follows; just show what would happen")
     ap.add_argument("--nodesc", action="store_true",
                     help="(following mode only) Auto-unfollow accounts with empty bio/description first (no prompt; combine with --dry-run).")
