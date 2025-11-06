@@ -150,20 +150,28 @@ def main():
     follows = get_all_follows(args.service, access, confirmed_handle, args.limit)
     print(f"Found {len(follows)} accounts you follow.\n")
 
-    # Iterate and filter by keywords in description
+    # Iterate and filter by keywords in bio + description
     kept, candidates, empties = 0, 0, 0
     for f in follows:
         actor = f.get("handle") or f.get("did") or "<unknown>"
         display = f.get("displayName") or actor
-        desc = (f.get("description") or "").strip()
-        desc_lc = desc.lower()
 
-        # NEW: auto-remove empty descriptions if requested
-        if args.nodesc and not desc:
+        # Gather both "bio" and "description" if present
+        # - Primary description field (often the user profile bio)
+        desc = (f.get("description") or "").strip()
+        # - Some payloads (or future shapes) may expose a separate "bio" or nested profile description
+        bio = (f.get("bio") or ((f.get("profile") or {}).get("description") or "")).strip()
+
+        # Combined text for keyword matching and display
+        text = " ".join([s for s in (bio, desc) if s])
+        text_lc = text.lower()
+
+        # Auto-remove accounts with no bio AND no description
+        if args.nodesc and not text:
             follow_uri = (f.get("viewer") or {}).get("following")
             print("=" * 72)
             print(f"{display}  (@{actor})")
-            print("Bio: (no description)")
+            print("Bio/Description: (no description)")
             if not follow_uri:
                 print("Warning: No follow record URI available (cannot auto-unfollow from here).")
             else:
@@ -178,7 +186,8 @@ def main():
             empties += 1
             continue  # skip keyword checks & prompts
 
-        match = any(kw in desc_lc for kw in keywords) if keywords else False
+        # Keyword match across both bio + description
+        match = any(kw in text_lc for kw in keywords) if keywords else False
 
         if match:
             kept += 1
@@ -187,7 +196,7 @@ def main():
         candidates += 1
         print("=" * 72)
         print(f"{display}  (@{actor})")
-        print(f"Bio: {desc if desc else '(no description)'}")
+        print(f"Bio/Description: {text if text else '(no description)'}")
         print("No keyword match.")
         # Need the follow record URI to unfollow via deleteRecord
         follow_uri = (f.get("viewer") or {}).get("following")
