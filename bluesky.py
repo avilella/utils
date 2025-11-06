@@ -323,95 +323,124 @@ def mode_searching(args, service, access, did, handle, keywords):
 
 def mode_degreesearch(args, service, access, did, handle, keywords):
     """
-    degree=0: your follows that match keywords (bio/description)
-    degree=1: their followers that also match keywords (bio/description)
-    Propose following those degree=1 accounts you don't already follow.
+    New behavior (iterative exploration):
+      1) Fetch up to --limit of *my follows* (degree 0 seeds).
+      2) For each seed, if its bio/description matches any keyword:
+         a) fetch that seed's followers (degree 1) up to --limit,
+         b) for each follower whose bio/description matches:
+            - prompt to follow,
+            - on 'y', follow (or simulate in --dry-run),
+            - add that newly-followed account to the queue of seeds to expand next.
+      3) Repeat 2) for newly-followed accounts until we have added --degreelimit accounts,
+         or we run out of candidates.
     """
-    # 1) Load my follows (degree 0 universe) and determine which already followed (for skip)
-    my_follows = get_all_follows(service, access, handle, total_limit=10000)
-    already = set([ (x.get("did") or x.get("handle")) for x in my_follows if (x.get("did") or x.get("handle")) ])
+    def combine_bio_desc(obj):
+        desc = (obj.get("description") or "").strip()
+        bio = (obj.get("bio") or ((obj.get("profile") or {}).get("description") or "")).strip()
+        return (" ".join([s for s in (bio, desc) if s])).strip()
 
-    # 2) Filter degree-0 to those matching keywords; stop when we reach --degreelimit seeds
-    deg0 = []
-    for f in my_follows:
-        if len(deg0) >= max(1, args.degreelimit):
-            break
-        text = combine_bio_desc(f).lower()
-        if not text:
+    def text_matches(obj):
+        txt = combine_bio_desc(obj)
+        return txt, (txt and any(kw in txt.lower() for kw in keywords))
+
+    # Load up to --limit of my current follows (degree 0 seed list)
+    base_seeds = get_all_follows(service, access, handle, total_limit=max(1, args.limit))
+    print(f"Loaded {len(base_seeds)} of your follows (seed candidates, capped by --limit={args.limit}).")
+
+    # Build set of accounts I'm already following (by did/handle) to avoid re-suggesting
+    already_following = set()
+    for s in get_all_follows(service, access, handle, total_limit=10000):
+        key = s.get("did") or s.get("handle")
+        if key:
+            already_following.add(key)
+
+    # The queue of seeds to expand (start with the base seeds)
+    # We'll expand only seeds whose bio/description matches a keyword.
+    from collections import deque
+    queue = deque(base_seeds)
+    visited_seeds = set()  # did/handle keys we've expanded as seeds
+    added = 0              # new follows in this session
+    skipped = 0
+
+    # Helper to normalize an object key
+    def key_of(obj):
+        return obj.get("did") or obj.get("handle")
+
+    # Exploration loop
+    while queue and added < max(1, args.degreelimit):
+        seed = queue.popleft()
+        seed_key = key_of(seed)
+        if not seed_key or seed_key in visited_seeds:
             continue
-        if any(kw in text for kw in keywords):
-            deg0.append(f)
+        visited_seeds.add(seed_key)
 
-    print(f"Degree 0 matches (my follows with keywords): {len(deg0)} (capped by --degreelimit={args.degreelimit})")
+        seed_text, seed_ok = text_matches(seed)
+        if not seed_ok:
+            continue  # only expand seeds with keyword match
 
-    # 3) For each degree-0 seed, gather degree-1 followers that match keywords and that I don't already follow
-    cand_map = {}  # key -> {actor, text, src}
-    page_size = max(1, min(50, args.degreelimit))
-    max_pages = max(1, (max(1, args.degreelimit) + page_size - 1) // page_size)
-
-    for src in deg0:
-        src_handle = src.get("handle") or src.get("did") or "<unknown>"
-        followers = get_followers(
-            service, access, src_handle,
-            total_limit=max(1, args.degreelimit),
-            page_size=page_size,
-            max_pages=max_pages
-        )
-        for a in followers:
-            key = a.get("did") or a.get("handle")
-            if not key or key in already:
-                continue
-            text = combine_bio_desc(a)
-            if not text:
-                continue
-            tlc = text.lower()
-            if not any(kw in tlc for kw in keywords):
-                continue
-            if (a.get("viewer") or {}).get("following"):
-                continue
-            prev = cand_map.get(key)
-            if (not prev) or (len(text) > len(prev["text"])):
-                cand_map[key] = {"actor": a, "text": text, "src": src_handle}
-
-    candidates = list(cand_map.values())
-    print(f"Degree 1 candidate accounts not currently followed: {len(candidates)}\n")
-
-    added, skipped = 0, 0
-    for ent in candidates:
-        a = ent["actor"]
-        text = ent["text"]
-        display = a.get("displayName") or a.get("handle") or a.get("did") or "<unknown>"
-        handle_or_did = a.get("handle") or a.get("did") or "<unknown>"
-        origin = ent["src"]
-
+        seed_handle_or_did = seed.get("handle") or seed.get("did") or "<unknown>"
         print("=" * 72)
-        print(f"{display}  (@{handle_or_did})  — follower of: {origin}")
-        print(f"Bio/Description: {text if text else '(no description)'}")
-        print("Follow this account? [y/N]: ", end="", flush=True)
-        choice = sys.stdin.readline().strip().lower()
-        if choice == "y":
-            if args.dry_run:
-                print("[dry-run] Would follow (create record).")
-                added += 1
-            else:
-                try:
-                    subject_did = a.get("did")
-                    if not subject_did:
-                        print("No DID for actor; cannot follow.")
-                        skipped += 1
-                        continue
-                    create_follow_record(service, access, did, subject_did)
-                    print("Followed.")
+        print(f"Expanding seed: {seed.get('displayName') or seed_handle_or_did} (@{seed_handle_or_did})")
+        print(f"Bio/Description: {seed_text if seed_text else '(no description)'}")
+
+        # Fetch followers of the seed, capped by --limit
+        followers = get_followers(
+            service, access, seed_handle_or_did,
+            total_limit=max(1, args.limit),
+            page_size=min(50, max(1, args.limit)),
+            max_pages=max(1, (max(1, args.limit) + 49)//50)
+        )
+        print(f"  Found {len(followers)} followers to review (capped by --limit={args.limit}).")
+
+        # For each follower: if matches keywords and not already following, propose to follow
+        for f in followers:
+            if added >= max(1, args.degreelimit):
+                break
+            f_key = key_of(f)
+            if not f_key or f_key in already_following:
+                continue
+
+            f_text, f_ok = text_matches(f)
+            if not f_ok:
+                continue
+
+            display = f.get("displayName") or f.get("handle") or f.get("did") or "<unknown>"
+            handle_or_did = f.get("handle") or f.get("did") or "<unknown>"
+            print("-" * 72)
+            print(f"Candidate: {display}  (@{handle_or_did})  — follower of seed above")
+            print(f"Bio/Description: {f_text if f_text else '(no description)'}")
+            print("Follow this account? [y/N]: ", end="", flush=True)
+            choice = sys.stdin.readline().strip().lower()
+
+            if choice == "y":
+                # Treat as followed (even in dry-run) to allow further expansion
+                already_following.add(f_key)
+                if args.dry_run:
+                    print("[dry-run] Would follow (create record).")
                     added += 1
-                except Exception as e:
-                    print(f"Failed to follow: {e}")
-                    skipped += 1
-        else:
-            skipped += 1
-            print("Skipped.")
+                    # enqueue this as a new seed for expansion
+                    queue.append(f)
+                else:
+                    try:
+                        subject_did = f.get("did")
+                        if not subject_did:
+                            print("No DID for actor; cannot follow.")
+                            skipped += 1
+                            continue
+                        create_follow_record(service, access, did, subject_did)
+                        print("Followed.")
+                        added += 1
+                        # enqueue this as a new seed for expansion
+                        queue.append(f)
+                    except Exception as e:
+                        print(f"Failed to follow: {e}")
+                        skipped += 1
+            else:
+                skipped += 1
+                print("Skipped.")
 
     print("\nDone.")
-    print(f"Degree 1 followed new accounts: {added}")
+    print(f"New follows added this session: {added} (target --degreelimit={args.degreelimit})")
     print(f"Skipped: {skipped}")
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
