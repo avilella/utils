@@ -58,7 +58,7 @@ def get_session(service, identifier, password):
 
 def get_all_follows(service, access_jwt, actor_handle, total_limit=100, page_size=100, max_pages=100):
     """
-    Fetch up to `total_limit` follows of actor_handle.
+    Fetch up to `total_limit` follows (who actor_handle is following).
     """
     base_url = f"{service}/xrpc/app.bsky.graph.getFollows"
     headers = {"Authorization": f"Bearer {access_jwt}"}
@@ -85,6 +85,36 @@ def get_all_follows(service, access_jwt, actor_handle, total_limit=100, page_siz
         cursor = new_cursor
     return follows
 
+def get_followers(service, access_jwt, actor, total_limit=100, page_size=100, max_pages=100):
+    """
+    Fetch up to `total_limit` followers (who follows actor).
+    `actor` can be handle or did.
+    """
+    base_url = f"{service}/xrpc/app.bsky.graph.getFollowers"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    followers, seen = [], set()
+    cursor = None
+    pages, fetched = 0, 0
+
+    while fetched < total_limit and pages < max_pages:
+        limit = min(page_size, total_limit - fetched)
+        q = f"?actor={actor}&limit={limit}"
+        if cursor: q += f"&cursor={cursor}"
+        out = run_curl("GET", base_url + q, headers=headers)
+        batch = out.get("followers", []) or []
+        new_cursor = out.get("cursor")
+        if not batch: break
+        for item in batch:
+            key = item.get("did") or item.get("handle")
+            if key in seen: continue
+            followers.append(item); seen.add(key)
+            fetched += 1
+            if fetched >= total_limit: break
+        pages += 1
+        if not new_cursor or new_cursor == cursor: break
+        cursor = new_cursor
+    return followers
+
 def delete_follow_record(service, access_jwt, my_repo, at_uri):
     """
     Delete a follow record: at://<repo>/app.bsky.graph.follow/<rkey>
@@ -108,7 +138,6 @@ def create_follow_record(service, access_jwt, my_repo, subject_did):
     url = f"{service}/xrpc/com.atproto.repo.createRecord"
     headers = {"Authorization": f"Bearer {access_jwt}"}
     record = {
-        # "$type": "app.bsky.graph.follow",  # not strictly required when collection is given
         "subject": subject_did,
         "createdAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
@@ -292,18 +321,115 @@ def mode_searching(args, service, access, did, handle, keywords):
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
 
+def mode_degreesearch(args, service, access, did, handle, keywords):
+    """
+    degree=0: your follows that match keywords (bio/description)
+    degree=1: their followers that also match keywords (bio/description)
+    Propose following those degree=1 accounts you don't already follow.
+    """
+    # 1) Load my follows (degree 0 universe) and determine which already followed (for skip)
+    my_follows = get_all_follows(service, access, handle, total_limit=10000)
+    already = set([ (x.get("did") or x.get("handle")) for x in my_follows if (x.get("did") or x.get("handle")) ])
+
+    # 2) Filter degree-0 to those matching keywords; stop when we reach --degreelimit seeds
+    deg0 = []
+    for f in my_follows:
+        if len(deg0) >= max(1, args.degreelimit):
+            break
+        text = combine_bio_desc(f).lower()
+        if not text:
+            continue
+        if any(kw in text for kw in keywords):
+            deg0.append(f)
+
+    print(f"Degree 0 matches (my follows with keywords): {len(deg0)} (capped by --degreelimit={args.degreelimit})")
+
+    # 3) For each degree-0 seed, gather degree-1 followers that match keywords and that I don't already follow
+    cand_map = {}  # key -> {actor, text, src}
+    page_size = max(1, min(50, args.degreelimit))
+    max_pages = max(1, (max(1, args.degreelimit) + page_size - 1) // page_size)
+
+    for src in deg0:
+        src_handle = src.get("handle") or src.get("did") or "<unknown>"
+        followers = get_followers(
+            service, access, src_handle,
+            total_limit=max(1, args.degreelimit),
+            page_size=page_size,
+            max_pages=max_pages
+        )
+        for a in followers:
+            key = a.get("did") or a.get("handle")
+            if not key or key in already:
+                continue
+            text = combine_bio_desc(a)
+            if not text:
+                continue
+            tlc = text.lower()
+            if not any(kw in tlc for kw in keywords):
+                continue
+            if (a.get("viewer") or {}).get("following"):
+                continue
+            prev = cand_map.get(key)
+            if (not prev) or (len(text) > len(prev["text"])):
+                cand_map[key] = {"actor": a, "text": text, "src": src_handle}
+
+    candidates = list(cand_map.values())
+    print(f"Degree 1 candidate accounts not currently followed: {len(candidates)}\n")
+
+    added, skipped = 0, 0
+    for ent in candidates:
+        a = ent["actor"]
+        text = ent["text"]
+        display = a.get("displayName") or a.get("handle") or a.get("did") or "<unknown>"
+        handle_or_did = a.get("handle") or a.get("did") or "<unknown>"
+        origin = ent["src"]
+
+        print("=" * 72)
+        print(f"{display}  (@{handle_or_did})  — follower of: {origin}")
+        print(f"Bio/Description: {text if text else '(no description)'}")
+        print("Follow this account? [y/N]: ", end="", flush=True)
+        choice = sys.stdin.readline().strip().lower()
+        if choice == "y":
+            if args.dry_run:
+                print("[dry-run] Would follow (create record).")
+                added += 1
+            else:
+                try:
+                    subject_did = a.get("did")
+                    if not subject_did:
+                        print("No DID for actor; cannot follow.")
+                        skipped += 1
+                        continue
+                    create_follow_record(service, access, did, subject_did)
+                    print("Followed.")
+                    added += 1
+                except Exception as e:
+                    print(f"Failed to follow: {e}")
+                    skipped += 1
+        else:
+            skipped += 1
+            print("Skipped.")
+
+    print("\nDone.")
+    print(f"Degree 1 followed new accounts: {added}")
+    print(f"Skipped: {skipped}")
+    if args.dry_run:
+        print("NOTE: dry-run mode; no changes were made.")
+
 # ------------------------- main -------------------------
 def main():
     ap = argparse.ArgumentParser(description="Audit / discover follows on Bluesky using keywords in bio/description.")
-    ap.add_argument("-m", "--mode", choices=["following","searching"], default="following",
-                    help="Mode of operation: 'following' (review current follows) or 'searching' (discover new accounts to follow). Default: following.")
+    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch"], default="following",
+                    help="Mode: 'following' (review current follows), 'searching' (discover by keyword), 'degreesearch' (followers of your keyword-matching follows).")
     ap.add_argument("--creds", required=True, help="Path to file: line1=<handle>, line2=<app_password>")
     ap.add_argument("--keywords", required=True, help="Path to newline-separated keywords (case-insensitive)")
     ap.add_argument("--service", default="https://bsky.social", help="PDS base URL (default: https://bsky.social)")
-    ap.add_argument("--limit", type=int, default=100, help="Page size / limits (search will use up to this per keyword)")
+    ap.add_argument("--limit", type=int, default=100, help="For following/searching: page-size/limit used in those modes.")
+    ap.add_argument("--degreelimit", type=int, default=100,
+                    help="For degreesearch: max degree-0 seeds to inspect AND per-seed followers fetched.")
     ap.add_argument("--dry-run", action="store_true", help="Don’t actually change follows; just show what would happen")
     ap.add_argument("--nodesc", action="store_true",
-                    help="(following mode only) Auto-unfollow accounts with empty bio/description first (no prompt; combine with --dry-run to preview)")
+                    help="(following mode only) Auto-unfollow accounts with empty bio/description first (no prompt; combine with --dry-run).")
     args = ap.parse_args()
 
     handle, app_password = read_creds(Path(args.creds))
@@ -317,8 +443,10 @@ def main():
 
     if args.mode == "following":
         mode_following(args, args.service, access, did, confirmed_handle, keywords)
-    else:
+    elif args.mode == "searching":
         mode_searching(args, args.service, access, did, confirmed_handle, keywords)
+    else:
+        mode_degreesearch(args, args.service, access, did, confirmed_handle, keywords)
 
 if __name__ == "__main__":
     main()
