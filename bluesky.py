@@ -519,10 +519,10 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
             print("-" * 72)
             print(f"Candidate (depth {depth+1}): {display}  (@{handle_or_did})  — follower of seed above")
             print(f"Bio/Description: {f_text if f_text else '(no description)'}")
-            print("Follow this account? [y/N]: ", end="", flush=True)
+            print("Follow this account? [Y/n]: ", end="", flush=True)
             choice = sys.stdin.readline().strip().lower()
-
-            if choice == "y":
+            
+            if choice in ("", "y", "yes"):
                 # Treat as followed (even in dry-run) to allow further expansion
                 already_following.add(f_key)
                 if args.dry_run:
@@ -537,12 +537,12 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
                         if not subject_did:
                             print("No DID for actor; cannot follow.")
                             skipped += 1
-                            continue
-                        create_follow_record(service, access, did, subject_did)
-                        print("Followed.")
-                        added += 1
-                        if depth + 1 <= max_depth - 1:
-                            queue.append((f, depth + 1))
+                        else:
+                            create_follow_record(service, access, did, subject_did)
+                            print("Followed.")
+                            added += 1
+                            if depth + 1 <= max_depth - 1:
+                                queue.append((f, depth + 1))
                     except Exception as e:
                         print(f"Failed to follow: {e}")
                         skipped += 1
@@ -556,13 +556,83 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
 
+def mode_wordmap(args, service, access, did, handle):
+    """
+    Build a word frequency map from bios/descriptions across either
+    your 'following' or your 'followers' set.
+
+    - Does NOT require or use --keywords.
+    - Select source with --following or --followers (exactly one).
+    - Prints a descending list: word<TAB>count.
+    """
+    import re
+    from collections import Counter
+
+    # Validate selection: exactly one of --following / --followers
+    use_following = bool(getattr(args, "wordmap_following", False))
+    use_followers = bool(getattr(args, "wordmap_followers", False))
+    if use_following == use_followers:
+        print("Please specify exactly one of --following or --followers for wordmap mode.", file=sys.stderr)
+        return
+
+    # Fetch people set
+    if use_followers:
+        print("Fetching your followers for wordmap ...")
+        people = get_followers(service, access, handle, total_limit=10**12, page_size=100, max_pages=10000)
+        src_label = "followers"
+    else:
+        print("Fetching your follows for wordmap ...")
+        people = get_all_follows(service, access, handle, total_limit=10**12, page_size=100, max_pages=10000)
+        src_label = "following"
+
+    print(f"Loaded {len(people)} accounts from {src_label}.")
+
+    # Tokenize bios/descriptions, count words (basic alnum tokens), filter stopwords and very short tokens
+    token_re = re.compile(r"[A-Za-z0-9]+")
+    stopwords = {
+        # minimal stopword set; expand as needed
+        "the","and","for","you","your","with","are","that","this","from","have","has","was","were","but","not","all",
+        "our","about","into","out","over","under","on","in","of","to","a","an","as","by","at","it","we","they","them",
+        "be","is","am","or","if","so","my","me","their","his","her","he","she","i","us","rt"
+    }
+
+    counts = Counter()
+    processed = 0
+    for person in people:
+        text = combine_bio_desc(person)
+        if not text:
+            continue
+        for tok in token_re.findall(text.lower()):
+            if len(tok) < 3:
+                continue
+            if tok in stopwords:
+                continue
+            counts[tok] += 1
+        processed += 1
+        if processed % 500 == 0:
+            sys.stderr.write(".")  # progress feedback for large sets
+            sys.stderr.flush()
+
+    if processed >= 500:
+        sys.stderr.write("\n")
+        sys.stderr.flush()
+
+    if not counts:
+        print("No words found in bios/descriptions.")
+        return
+
+    print("\nWord frequency (descending):")
+    for word, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+        print(f"{word}\t{cnt}")
+
+
 # ------------------------- main -------------------------
 def main():
     ap = argparse.ArgumentParser(description="Audit / discover follows on Bluesky using keywords in bio/description.")
-    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch"], default="following",
+    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch","wordmap"], default="following",
                     help="Mode: 'following' (review current follows), 'searching' (discover by keyword), 'degreesearch' (followers of your keyword-matching follows).")
     ap.add_argument("--creds", required=True, help="Path to file: line1=<handle>, line2=<app_password>")
-    ap.add_argument("--keywords", required=True, help="Path to newline-separated keywords (case-insensitive)")
+    ap.add_argument("--keywords", required=False, help="(Optional) Path to newline-separated keywords (case-insensitive). Not used in 'wordmap' mode.")
     ap.add_argument("--service", default="https://bsky.social", help="PDS base URL (default: https://bsky.social)")
     ap.add_argument("--limit", type=int, default=100, help="For following/searching: page-size/limit used in those modes.")
     ap.add_argument("--degreelimit", type=int, default=100,
@@ -573,12 +643,19 @@ def main():
         action="store_true",
         help="Scan ALL follows and return only accounts with empty/missing description. In this mode, --limit is the per-page batch size."
     )
+    # Wordmap source selection (used with -m wordmap). Exactly one must be set.
+    ap.add_argument("--following", dest="wordmap_following", action="store_true",
+                    help="(wordmap mode) Analyze accounts you follow.")
+    ap.add_argument("--followers", dest="wordmap_followers", action="store_true",
+                    help="(wordmap mode) Analyze accounts that follow you.")
+
     args = ap.parse_args()
 
     handle, app_password = read_creds(Path(args.creds))
-    keywords = read_keywords(Path(args.keywords))
-    if not keywords:
-        print("No keywords provided; nothing to match.", file=sys.stderr)
+    if args.keywords:
+        keywords = read_keywords(Path(args.keywords))
+        if not keywords:
+            print("No keywords provided; nothing to match.", file=sys.stderr)
 
     print(f"Logging in as {handle} @ {args.service} ...")
     access, did, confirmed_handle = get_session(args.service, handle, app_password)
@@ -612,6 +689,8 @@ def main():
         mode_following(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "searching":
         mode_searching(args, args.service, access, did, confirmed_handle, keywords)
+    elif args.mode == "wordmap":
+        mode_wordmap(args, args.service, access, did, confirmed_handle)
     else:
         mode_degreesearch(args, args.service, access, did, confirmed_handle, keywords)
 
