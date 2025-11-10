@@ -5,6 +5,25 @@ import json
 import sys
 from pathlib import Path
 from datetime import datetime
+from collections import deque, Counter
+import re
+
+"""
+Bluesky follow/unfollow/search tool (batched, v3)
+
+This version adds per-100-account STDERR stats during *degreesearch*,
+while keeping the batched streaming structure across modes.
+
+Modes:
+  - following     : review/manage the accounts you already follow
+  - searching     : discover accounts by keyword search
+  - degreesearch  : breadth-first exploration across followers of matching seeds
+  - wordmap       : build a word frequency map from bios/descriptions (followers or following)
+
+Key structure:
+  * Pagination functions yield batches of size --limit.
+  * Actions occur batch-by-batch, not after preloading huge lists.
+"""
 
 # ------------------------- HTTP helper -------------------------
 def run_curl(method, url, headers=None, data=None):
@@ -37,11 +56,13 @@ def read_creds(path: Path):
     return handle, password
 
 def read_keywords(path: Path):
+    # Treat each line as a *phrase*; normalize whitespace and lowercase
+    # so multi-word entries match as a contiguous phrase (case-insensitive).
     kws = []
     for line in path.read_text(encoding="utf-8").splitlines():
-        kw = line.strip()
+        kw = " ".join(line.strip().lower().split())
         if kw:
-            kws.append(kw.lower())
+            kws.append(kw)
     return kws
 
 # ------------------------- ATProto helpers -------------------------
@@ -56,154 +77,81 @@ def get_session(service, identifier, password):
         raise RuntimeError("Login succeeded but did not return accessJwt and/or did")
     return access, did, handle
 
-import sys
-
-def get_all_follows(service, access_jwt, actor_handle,
-                    total_limit=100, page_size=100, max_pages=100,
-                    nodesc=False):
+# ------------------------- Pagination helpers (generators) -------------------------
+def iter_follows(service, access_jwt, actor_handle, batch_size=100, max_pages=1000):
     """
-    If nodesc=False:
-      - Fetch up to `total_limit` follows, paging with `page_size`.
-    If nodesc=True:
-      - Treat `page_size` as the *batch size* per request (use --limit to set it).
-      - Keep paging until we've scanned ALL follows (or hit max_pages),
-        and return ONLY accounts whose 'description' is empty or missing.
-      - Prints a '.' to stderr every 100 accounts processed for progress feedback.
+    Yield lists of follows (accounts you follow) in batches of size `batch_size`.
     """
     base_url = f"{service}/xrpc/app.bsky.graph.getFollows"
     headers = {"Authorization": f"Bearer {access_jwt}"}
-
-    results = []
-    seen = set()
     cursor = None
     pages = 0
-    fetched_total = 0  # total processed, not just matches
-
     while pages < max_pages:
-        # Determine how many to ask for this page
-        if nodesc:
-            limit = page_size  # --limit = batch size
-        else:
-            if fetched_total >= total_limit:
-                break
-            limit = min(page_size, total_limit - fetched_total)
-
-        q = f"?actor={actor_handle}&limit={limit}"
+        q = f"?actor={actor_handle}&limit={max(1, int(batch_size))}"
         if cursor:
             q += f"&cursor={cursor}"
-
-        out = run_curl("GET", base_url + q, headers=headers)
-        batch = out.get("follows", []) or []
-        new_cursor = out.get("cursor")
-
-        if not batch:
-            break
-
-        pages += 1
-        cursor_unchanged = (new_cursor == cursor)
-        cursor = new_cursor
-
-        for item in batch:
-            key = item.get("did") or item.get("handle")
-            if key in seen:
-                continue
-            seen.add(key)
-            fetched_total += 1
-
-            # progress dot every 100 accounts in --nodesc mode
-            if nodesc and fetched_total % 100 == 0:
-                sys.stderr.write(".")
-                sys.stderr.flush()
-
-            if nodesc:
-                desc = (item.get("description") or "").strip()
-                if desc == "":
-                    results.append(item)
-            else:
-                results.append(item)
-                if fetched_total >= total_limit:
-                    break
-
-        if not cursor or cursor_unchanged:
-            break
-        if not nodesc and fetched_total >= total_limit:
-            break
-
-    if nodesc:
-        sys.stderr.write("\n")  # newline after progress dots
-        sys.stderr.flush()
-
-    return results
-
-def get_following_set(service, access_jwt, actor_handle, page_size=100, max_pages=1000):
-    """
-    Returns a set of DIDs that you (actor_handle) already follow.
-    """
-    base_url = f"{service}/xrpc/app.bsky.graph.getFollows"
-    headers = {"Authorization": f"Bearer {access_jwt}"}
-
-    dids = set()
-    cursor = None
-    pages = 0
-
-    while pages < max_pages:
-        q = f"?actor={actor_handle}&limit={page_size}"
-        if cursor:
-            q += f"&cursor={cursor}"
-
         out = run_curl("GET", base_url + q, headers=headers)
         batch = out.get("follows", []) or []
         if not batch:
             break
-
-        for it in batch:
-            if it.get("did"):
-                dids.add(it["did"])
-
+        yield batch
         cursor_new = out.get("cursor")
         pages += 1
         if not cursor_new or cursor_new == cursor:
             break
         cursor = cursor_new
 
-    return dids
-
-
-def get_followers(service, access_jwt, actor, total_limit=100, page_size=100, max_pages=100):
+def iter_followers(service, access_jwt, actor, batch_size=100, max_pages=1000):
     """
-    Fetch up to `total_limit` followers (who follows actor).
-    `actor` can be handle or did.
+    Yield the 'followers' list page-by-page (batches of size <= batch_size).
     """
     base_url = f"{service}/xrpc/app.bsky.graph.getFollowers"
     headers = {"Authorization": f"Bearer {access_jwt}"}
-    followers, seen = [], set()
     cursor = None
-    pages, fetched = 0, 0
-
-    while fetched < total_limit and pages < max_pages:
-        limit = min(page_size, total_limit - fetched)
-        q = f"?actor={actor}&limit={limit}"
-        if cursor: q += f"&cursor={cursor}"
+    pages = 0
+    while pages < max_pages:
+        q = f"?actor={actor}&limit={max(1, int(batch_size))}"
+        if cursor:
+            q += f"&cursor={cursor}"
         out = run_curl("GET", base_url + q, headers=headers)
         batch = out.get("followers", []) or []
-        new_cursor = out.get("cursor")
-        if not batch: break
-        for item in batch:
-            key = item.get("did") or item.get("handle")
-            if key in seen: continue
-            followers.append(item); seen.add(key)
-            fetched += 1
-            if fetched >= total_limit: break
+        if not batch:
+            break
+        yield batch
+        cursor_new = out.get("cursor")
         pages += 1
-        if not new_cursor or new_cursor == cursor: break
-        cursor = new_cursor
-    return followers
+        if not cursor_new or cursor_new == cursor:
+            break
+        cursor = cursor_new
 
+def iter_search_actors(service, access_jwt, keyword, batch_size=50, max_pages=5):
+    """
+    Search actors by keyword and yield results in batches (pages).
+    """
+    base_url = f"{service}/xrpc/app.bsky.actor.searchActors"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    cursor = None
+    pages = 0
+    while pages < max_pages:
+        q = f"?q={keyword}&limit={max(1, int(batch_size))}"
+        if cursor:
+            q += f"&cursor={cursor}"
+        out = run_curl("GET", base_url + q, headers=headers)
+        batch = out.get("actors", []) or []
+        if not batch:
+            break
+        yield batch
+        cursor = out.get("cursor")
+        pages += 1
+        if not cursor:
+            break
+
+# ------------------------- Record helpers -------------------------
 def delete_follow_record(service, access_jwt, my_repo, at_uri):
     """
     Delete a follow record: at://<repo>/app.bsky.graph.follow/<rkey>
     """
-    if not at_uri.startswith("at://"):
+    if not at_uri or not at_uri.startswith("at://"):
         raise ValueError(f"Unexpected follow URI: {at_uri}")
     parts = at_uri.split("/")
     if len(parts) < 5:
@@ -232,172 +180,213 @@ def create_follow_record(service, access_jwt, my_repo, subject_did):
     }
     return run_curl("POST", url, headers=headers, data=payload)
 
-def search_actors_by_keyword(service, access_jwt, keyword, page_limit=50, max_pages=5):
-    """
-    Search actors by keyword. Returns a list of actor dicts.
-    """
-    base_url = f"{service}/xrpc/app.bsky.actor.searchActors"
-    headers = {"Authorization": f"Bearer {access_jwt}"}
-    actors, seen, cursor = [], set(), None
-    pages = 0
-    while pages < max_pages:
-        q = f"?q={keyword}&limit={page_limit}"
-        if cursor: q += f"&cursor={cursor}"
-        out = run_curl("GET", base_url + q, headers=headers)
-        batch = out.get("actors", []) or []
-        if not batch: break
-        for a in batch:
-            key = a.get("did") or a.get("handle")
-            if not key or key in seen: continue
-            actors.append(a); seen.add(key)
-        cursor = out.get("cursor")
-        if not cursor: break
-        pages += 1
-    return actors
+# ------------------------- List helpers -------------------------
+def _build_list_name_from_keywords(keywords, max_len=64):
+    # Deterministic name: sorted unique keywords joined by '/'.
+    # If it exceeds max_len, include as many as fit and append '/+N' for overflow.
+    toks = sorted({(kw or '').strip().lower() for kw in (keywords or []) if (kw or '').strip()})
+    if not toks:
+        return "keywords"
+    name = "/".join(toks)
+    if len(name) <= max_len:
+        return name
+    pieces, used = [], 0
+    for t in toks:
+        sep = "/" if pieces else ""
+        if used + len(sep) + len(t) > max_len - 4:  # reserve 4 chars for '/+N'
+            break
+        pieces.append(t)
+        used += len(sep) + len(t)
+    more = len(toks) - len(pieces)
+    return "/".join(pieces) + f"/+{more}"
 
-# ------------------------- helpers -------------------------
+def create_list_record(service, access_jwt, my_repo, name, purpose="app.bsky.graph.defs#curatelist", description=None):
+    # Create a curated or moderation list in your repo and return {"uri": ..., "cid": ...}.
+    url = f"{service}/xrpc/com.atproto.repo.createRecord"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    record = {
+        "purpose": purpose,
+        "name": name,
+        "createdAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    if description:
+        record["description"] = description
+    payload = {
+        "repo": my_repo,
+        "collection": "app.bsky.graph.list",
+        "record": record,
+    }
+    return run_curl("POST", url, headers=headers, data=payload)
+
+def create_listitem_record(service, access_jwt, my_repo, list_uri, subject_did):
+    # Add `subject_did` to a list by creating an app.bsky.graph.listitem record.
+    url = f"{service}/xrpc/com.atproto.repo.createRecord"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    record = {
+        "subject": subject_did,
+        "list": list_uri,  # at://<your-did>/app.bsky.graph.list/<rkey>
+        "createdAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    payload = {
+        "repo": my_repo,
+        "collection": "app.bsky.graph.listitem",
+        "record": record,
+    }
+
+# ------------------------- text helpers -------------------------
 def combine_bio_desc(obj):
     desc = (obj.get("description") or "").strip()
     bio = (obj.get("bio") or ((obj.get("profile") or {}).get("description") or "")).strip()
     return (" ".join([s for s in (bio, desc) if s])).strip()
 
-# ------------------------- Modes -------------------------
+def matches_any_keyword(text, keywords):
+    """
+    Case-insensitive *phrase* match: each keyword line is a full phrase.
+    Normalize whitespace on both sides so 'Computational   Biologist'
+    in the keywords file matches 'computational biologist' in bios.
+    """
+    if not text or not keywords:
+        return False
+    t = " ".join(text.lower().split())
+    return any(kw in t for kw in keywords)
+
+# ------------------------- Modes (batched) -------------------------
 def mode_following(args, service, access, did, handle, keywords):
-    print("Fetching follows ...")
-    follows = get_all_follows(service, access, handle, total_limit=args.limit)
-    print(f"Found {len(follows)} accounts you follow.\n")
+    print("Streaming your follows in batches ...")
+    batch_size = max(1, args.limit)
+    kept, reviewed_no_match, empties = 0, 0, 0
+    batches = 0
 
-    # Reorder: empties first if --nodesc
-    if args.nodesc:
-        follows.sort(key=lambda f: 0 if not combine_bio_desc(f) else 1)
+    for follows in iter_follows(service, access, handle, batch_size=batch_size, max_pages=10000):
+        batches += 1
+        print(f"\n--- Batch {batches} (size={len(follows)}) ---")
 
-    kept, candidates, empties = 0, 0, 0
-    for f in follows:
-        text = combine_bio_desc(f)
-        actor = f.get("handle") or f.get("did") or "<unknown>"
-        display = f.get("displayName") or actor
+        if args.nodesc:
+            follows.sort(key=lambda f: 0 if not combine_bio_desc(f) else 1)
 
-        # Auto-remove empty if requested
-        if args.nodesc and not text:
-            follow_uri = (f.get("viewer") or {}).get("following")
+        for f in follows:
+            text = combine_bio_desc(a)
+            # Require full-phrase match for the line from --keywords (case-insensitive)
+            if not matches_any_keyword(text, [kw]):
+                continue
+
+            if args.nodesc and not text:
+                follow_uri = (f.get("viewer") or {}).get("following")
+                print("=" * 72)
+                print(f"{display}  (@{actor})")
+                print("Bio/Description: (no description)")
+                if not follow_uri:
+                    print("Warning: No follow record URI available (cannot auto-unfollow from here).")
+                else:
+                    if args.dry_run:
+                        print(f"[dry-run] Would unfollow (empty description) via record {follow_uri}")
+                    else:
+                        try:
+                            delete_follow_record(service, access, did, follow_uri)
+                            print("Unfollowed (empty description).")
+                        except Exception as e:
+                            print(f"Failed to unfollow: {e}")
+                empties += 1
+                continue
+
+            if matches_any_keyword(text, keywords):
+                kept += 1
+                continue
+
+            reviewed_no_match += 1
             print("=" * 72)
             print(f"{display}  (@{actor})")
-            print("Bio/Description: (no description)")
+            print(f"Bio/Description: {text if text else '(no description)'}")
+            print("No keyword match.")
+            follow_uri = (f.get("viewer") or {}).get("following")
             if not follow_uri:
                 print("Warning: No follow record URI available (cannot auto-unfollow from here).")
-            else:
+                print("Skip [n]: ", end="", flush=True)
+                _ = sys.stdin.readline()
+                continue
+
+            print("Unfollow this account? [y/N]: ", end="", flush=True)
+            choice = sys.stdin.readline().strip().lower()
+            if choice == "y":
                 if args.dry_run:
-                    print(f"[dry-run] Would unfollow (empty description) via record {follow_uri}")
+                    print(f"[dry-run] Would unfollow via record {follow_uri}")
                 else:
                     try:
                         delete_follow_record(service, access, did, follow_uri)
-                        print("Unfollowed (empty description).")
+                        print("Unfollowed.")
                     except Exception as e:
                         print(f"Failed to unfollow: {e}")
-            empties += 1
-            continue
-
-        # Keyword match across bio+desc
-        match = any(kw in text.lower() for kw in keywords) if keywords else False
-        if match:
-            kept += 1
-            continue
-
-        candidates += 1
-        print("=" * 72)
-        print(f"{display}  (@{actor})")
-        print(f"Bio/Description: {text if text else '(no description)'}")
-        print("No keyword match.")
-        follow_uri = (f.get("viewer") or {}).get("following")
-        if not follow_uri:
-            print("Warning: No follow record URI available (cannot auto-unfollow from here).")
-            print("Skip [n]: ", end="", flush=True)
-            _ = sys.stdin.readline()
-            continue
-
-        print("Unfollow this account? [y/N]: ", end="", flush=True)
-        choice = sys.stdin.readline().strip().lower()
-        if choice == "y":
-            if args.dry_run:
-                print(f"[dry-run] Would unfollow via record {follow_uri}")
             else:
-                try:
-                    delete_follow_record(service, access, did, follow_uri)
-                    print("Unfollowed.")
-                except Exception as e:
-                    print(f"Failed to unfollow: {e}")
-        else:
-            print("Left untouched.")
+                print("Left untouched.")
 
     print("\nDone.")
     print(f"Kept (keyword matched): {kept}")
-    print(f"Reviewed without match: {candidates}")
+    print(f"Reviewed without match: {reviewed_no_match}")
     if args.nodesc:
         print(f"Removed (empty description): {empties}")
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
 
 def mode_searching(args, service, access, did, handle, keywords):
-    # Build a set of already-followed DIDs to ensure we propose only non-followed
-    my_follows = get_all_follows(service, access, handle, total_limit=10000)  # up to 10k
-    already = set([ (x.get("did") or x.get("handle")) for x in my_follows if (x.get("did") or x.get("handle")) ])
+    if not keywords:
+        print("No keywords provided; nothing to search.", file=sys.stderr)
+        return
 
-    print(f"Searching for users by {len(keywords)} keyword(s) ...")
-    # Collect candidates across keywords
-    candidates_map = {}
-    for kw in keywords:
-        actors = search_actors_by_keyword(service, access, kw, page_limit=min(50, args.limit), max_pages=max(1, args.limit//50))
-        for a in actors:
-            key = a.get("did") or a.get("handle")
-            if not key or key in already:
-                continue
-            text = combine_bio_desc(a)
-            # Ensure the keyword appears in bio/description specifically
-            if kw not in (text.lower() if text else ""):
-                continue
-            # Also skip if viewer.following says true (server-side)
-            if (a.get("viewer") or {}).get("following"):
-                continue
-            prev = candidates_map.get(key)
-            if (not prev) or (len(text) > len(prev["text"])):
-                candidates_map[key] = {"actor": a, "text": text, "kw": kw}
-
-    candidates = list(candidates_map.values())
-    print(f"Found {len(candidates)} candidate accounts not currently followed.\n")
-
+    print(f"Searching for users by {len(keywords)} keyword(s) in batches of {args.limit} ...")
+    seen = set()
+    session_followed = set()
     added, skipped = 0, 0
-    for ent in candidates:
-        a = ent["actor"]
-        text = ent["text"]
-        display = a.get("displayName") or a.get("handle") or a.get("did") or "<unknown>"
-        handle_or_did = a.get("handle") or a.get("did") or "<unknown>"
+    batch_size = max(1, args.limit)
 
-        print("=" * 72)
-        print(f"{display}  (@{handle_or_did})")
-        print(f"Bio/Description: {text if text else '(no description)'}")
-        print(f"Matched keyword: {ent['kw']}")
-        print("Follow this account? [y/N]: ", end="", flush=True)
-        choice = sys.stdin.readline().strip().lower()
-        if choice == "y":
-            if args.dry_run:
-                print("[dry-run] Would follow (create record).")
-                added += 1
-            else:
-                try:
+    for kw in keywords:
+        pages = 0
+        for page in iter_search_actors(service, access, kw, batch_size=min(50, batch_size),
+                                       max_pages=max(1, (batch_size + 49)//50)):
+            pages += 1
+            print(f"\n--- Keyword '{kw}' — page {pages}, {len(page)} results ---")
+            for a in page:
+                key = a.get("did") or a.get("handle")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+
+                text = combine_bio_desc(a)
+                if kw not in (text.lower() if text else ""):
+                    continue
+
+                if (a.get("viewer") or {}).get("following") or key in session_followed:
+                    continue
+
+                display = a.get("displayName") or a.get("handle") or a.get("did") or "<unknown>"
+                handle_or_did = a.get("handle") or a.get("did") or "<unknown>"
+
+                print("=" * 72)
+                print(f"{display}  (@{handle_or_did})")
+                print(f"Bio/Description: {text if text else '(no description)'}")
+                print(f"Matched keyword: {kw}")
+                print("Follow this account? [y/N]: ", end="", flush=True)
+                choice = sys.stdin.readline().strip().lower()
+                if choice == "y":
                     subject_did = a.get("did")
                     if not subject_did:
                         print("No DID for actor; cannot follow.")
                         skipped += 1
                         continue
-                    create_follow_record(service, access, did, subject_did)
-                    print("Followed.")
-                    added += 1
-                except Exception as e:
-                    print(f"Failed to follow: {e}")
+                    session_followed.add(subject_did)
+                    if args.dry_run:
+                        print("[dry-run] Would follow (create record).")
+                        added += 1
+                    else:
+                        try:
+                            create_follow_record(service, access, did, subject_did)
+                            print("Followed.")
+                            added += 1
+                        except Exception as e:
+                            print(f"Failed to follow: {e}")
+                            skipped += 1
+                else:
                     skipped += 1
-        else:
-            skipped += 1
-            print("Skipped.")
+                    print("Skipped.")
 
     print("\nDone.")
     print(f"Followed new accounts: {added}")
@@ -407,148 +396,206 @@ def mode_searching(args, service, access, did, handle, keywords):
 
 def mode_degreesearch(args, service, access, did, handle, keywords):
     """
-    Depth-based exploration:
-      - Seeds: up to --limit of *my follows* (degree 0).
-      - For each seed that matches any keyword (bio/description):
-          fetch up to --limit of its followers (degree + 1).
-          For each follower that matches, prompt to follow.
-          If accepted, enqueue that account as a new seed with depth+1.
-      - Continue breadth-first until the queue is exhausted or we reach
-        the maximum DEPTH (--degreelimit). The number of accepted follows
-        does NOT stop the exploration; it only affects breadth of enqueued seeds.
+    Depth-based exploration (batched, streaming):
+      - Seeds streamed from your 'follows' in batches of --limit.
+      - Only seeds whose bio/description matches any keyword are expanded.
+      - For each matching seed, stream ONE page of its followers (size --limit) and prompt to follow.
+      - If you follow someone and depth < --degreelimit, enqueue that account as a new seed.
+    Prints per-100-account stats to STDERR.
     """
-    from collections import deque
+    if not keywords:
+        print("No keywords provided; nothing to match.", file=sys.stderr)
+        return
 
-    def combine_bio_desc(obj):
-        desc = (obj.get("description") or "").strip()
-        bio = (obj.get("bio") or ((obj.get("profile") or {}).get("description") or "")).strip()
-        return (" ".join([s for s in (bio, desc) if s])).strip()
-
-    def text_matches(obj):
-        txt = combine_bio_desc(obj)
-        return txt, (txt and any(kw in txt.lower() for kw in keywords))
-
-    # Normalize degreelimit to a minimum of 1 (seed -> followers)
     max_depth = max(1, int(args.degreelimit))
+    batch_size = max(1, args.limit)
 
-    # Load up to --limit of my current follows (degree 0 seeds)
-    base_seeds = get_all_follows(service, access, handle, total_limit=max(1, args.limit))
-    print(f"Loaded {len(base_seeds)} of your follows (seed candidates, capped by --limit={args.limit}).")
-    print(f"Exploring up to depth (--degreelimit) = {max_depth}.")
+    print(f"Exploring up to depth (--degreelimit) = {max_depth}. Batch size (--limit) = {batch_size}.")
 
-    # Build set of accounts I'm already following (by did/handle) to avoid re-suggesting
-    already_following = set()
-    for s in get_all_follows(service, access, handle, total_limit=10000):
-        key = s.get("did") or s.get("handle")
-        if key:
-            already_following.add(key)
+    # Stats that report every 100 follower-accounts processed
+    STATS_BATCH_N = 100
 
-    # Queue of (actor_obj, depth). Start with seeds at depth 0.
-    queue = deque((seed, 0) for seed in base_seeds)
-    visited_seeds = set()       # which actors we've expanded as seeds
-    seen_candidates = set()     # suggestions we've already shown
-    added = 0
-    skipped = 0
+    class Stats:
+        def __init__(self, n=STATS_BATCH_N):
+            self.n = n
+            self.cum = Counter()
+            self.block = Counter()
+
+        def _b(self, k, inc=1):
+            self.block[k] = self.block.get(k, 0) + inc
+            self.cum[k] = self.cum.get(k, 0) + inc
+
+        def account_seen(self):
+            self._b("followers_iterated", 1)
+            if self.block.get("followers_iterated", 0) >= self.n:
+                self.report_block()
+                self.block = Counter()
+
+        def seed_seen(self): self._b("seeds_seen", 1)
+        def seed_matched(self): self._b("seeds_matched", 1)
+
+        def no_key_skip(self): self._b("no_key_skip", 1)
+        def self_skip(self): self._b("self_skip", 1)
+        def already_following_skip(self): self._b("already_following_skip", 1)
+        def dedup_skip(self): self._b("dedup_skip", 1)
+        def keyword_miss(self): self._b("keyword_miss", 1)
+
+        def candidate(self): self._b("candidates_considered", 1); self._b("prompted", 1)
+        def followed(self): self._b("followed_added", 1)
+        def declined(self): self._b("user_declined", 1)
+        def no_did_skip(self): self._b("no_did_skip", 1)
+        def api_error(self): self._b("api_error", 1)
+        def enqueued(self): self._b("enqueued_new_seeds", 1)
+
+        def _format(self, d):
+            skipped = d.get("keyword_miss",0)+d.get("already_following_skip",0)+d.get("dedup_skip",0)+d.get("self_skip",0)+d.get("no_key_skip",0)
+            lines = [
+                f"  Followers processed: {d.get('followers_iterated',0)}  (skipped: {skipped})",
+                f"    - keyword_miss={d.get('keyword_miss',0)}, already_following={d.get('already_following_skip',0)}, dedup={d.get('dedup_skip',0)}, self={d.get('self_skip',0)}, no_key={d.get('no_key_skip',0)}",
+                f"  Candidates prompted: {d.get('prompted',0)}",
+                f"    - followed={d.get('followed_added',0)}, declined={d.get('user_declined',0)}, no_did={d.get('no_did_skip',0)}, api_error={d.get('api_error',0)}, enqueued_new_seeds={d.get('enqueued_new_seeds',0)}",
+                f"  Seeds: seen={d.get('seeds_seen',0)}, matched={d.get('seeds_matched',0)}",
+            ]
+            return '\n'.join(lines)
+
+        def report_block(self):
+            sys.stderr.write('\n[degreesearch] Stats for last %d accounts:\n' % self.n)
+            sys.stderr.write(self._format(self.block) + '\n')
+            sys.stderr.write('[degreesearch] Cumulative so far:\n')
+            sys.stderr.write(self._format(self.cum) + '\n')
+            sys.stderr.flush()
+
+    stats = Stats()
+
+    def seed_matches(obj):
+        return matches_any_keyword(combine_bio_desc(obj), keywords)
+
+    # Stream seeds from your follows
+    seed_source = iter_follows(service, access, handle, batch_size=batch_size, max_pages=10000)
+    seed_buffer = deque()
+    queue = deque()
+    visited_seeds = set()
+    seen_candidates = set()
+    session_followed = set()
+    added, skipped = 0, 0
+    source_exhausted = False
+    current_seed_batch_idx = 0
 
     def key_of(obj):
         return obj.get("did") or obj.get("handle")
 
-    while queue:
-        seed, depth = queue.popleft()
-        seed_key = key_of(seed)
-        if not seed_key or seed_key in visited_seeds:
-            continue
-        visited_seeds.add(seed_key)
+    def refill_seeds():
+        nonlocal source_exhausted, current_seed_batch_idx
+        if source_exhausted:
+            return False
+        try:
+            follows_batch = next(seed_source)
+        except StopIteration:
+            source_exhausted = True
+            return False
+        current_seed_batch_idx += 1
+        print(f"\n--- Seed batch {current_seed_batch_idx} (size={len(follows_batch)}) ---")
+        for s in follows_batch:
+            seed_buffer.append(s)
+        return True
 
-        # Only expand seeds that match keywords
-        seed_text, seed_ok = text_matches(seed)
-        if not seed_ok:
+    if not refill_seeds() and not seed_buffer:
+        print("You do not follow anyone (or no data returned).")
+        return
+
+    while True:
+        while seed_buffer and len(queue) < batch_size:
+            seed = seed_buffer.popleft()
+            k = key_of(seed)
+            if not k or k in visited_seeds:
+                continue
+            stats.seed_seen()
+            if not seed_matches(seed):
+                continue
+            stats.seed_matched()
+            queue.append((seed, 0))
+
+        if not queue:
+            if refill_seeds():
+                continue
+            break
+
+        seed, depth = queue.popleft()
+        k = key_of(seed)
+        if not k or k in visited_seeds:
+            continue
+        visited_seeds.add(k)
+
+        # Enforce keyword match at all depths before expanding this seed
+        if not seed_matches(seed):
+            # Not a keyword match anymore (or never was) — skip expanding
             continue
 
         seed_handle_or_did = seed.get("handle") or seed.get("did") or "<unknown>"
+        seed_text = combine_bio_desc(seed)
         print("=" * 72)
-        print(f"Depth {depth} seed: {seed.get('displayName') or seed_handle_or_did} (@{seed_handle_or_did})")
+        print(f"Seed (depth {depth}): {seed.get('displayName') or seed_handle_or_did} (@{seed_handle_or_did})")
         print(f"Bio/Description: {seed_text if seed_text else '(no description)'}")
 
-        # If we've reached max depth, do not expand further
         if depth >= max_depth:
-            print(f"(Reached max depth for this branch; not expanding followers.)")
+            print("(Reached max depth for this branch; not expanding followers.)")
             continue
 
-        # Fetch followers of this seed (next depth level)
-        followers = get_followers(
-            service, access, seed_handle_or_did,
-            total_limit=max(1, args.limit),
-            page_size=min(50, max(1, args.limit)),
-            max_pages=max(1, (max(1, args.limit) + 49)//50)
-        )
-        print(f"  Found {len(followers)} followers to review at depth {depth+1} (capped by --limit={args.limit}).")
+        # Fetch one page of followers for this seed
+        follower_pages = iter_followers(service, access, seed_handle_or_did, batch_size=batch_size, max_pages=1)
+        for followers in follower_pages:
+            print(f"  Followers page — {len(followers)} accounts to review at depth {depth+1}.")
+            for f in followers:
+                stats.account_seen()
+                f_key = key_of(f)
+                if not f_key:
+                    stats.no_key_skip(); continue
+                if f_key in seen_candidates:
+                    stats.dedup_skip(); continue
+                if f_key == did:
+                    stats.self_skip(); continue
+                if (f.get('viewer') or {}).get('following') or f_key in session_followed:
+                    stats.already_following_skip(); continue
 
-        for f in followers:
-            f_key = key_of(f)
-            if not f_key:
-                continue
-            # Skip yourself
-            if f_key == did:
-                continue
-            # Skip if already following (local set) or server reports a follow
-            if f_key in already_following or (f.get("viewer") or {}).get("following"):
-                continue
- 
-            f_text, f_ok = text_matches(f)
-            if not f_ok:
-                continue
- 
-            # Avoid showing the same candidate multiple times from different seeds
-            if f_key in seen_candidates:
-                continue
-            seen_candidates.add(f_key)
+                f_text = combine_bio_desc(f)
+                if not matches_any_keyword(f_text, keywords):
+                    stats.keyword_miss(); continue
 
-            f_key = key_of(f)
-            if not f_key:
-                continue
-            # Skip yourself
-            if f_key == did:
-                continue
-            # Skip if already following (local set) or server reports a follow
-            if f_key in already_following or (f.get("viewer") or {}).get("following"):
-                continue
+                seen_candidates.add(f_key)
+                display = f.get("displayName") or f.get("handle") or f.get("did") or "<unknown>"
+                handle_or_did = f.get("handle") or f.get("did") or "<unknown>"
+                print("-" * 72)
+                print(f"Candidate (depth {depth+1}): {display}  (@{handle_or_did})  — follower of seed above")
+                print(f"Bio/Description: {f_text if f_text else '(no description)'}")
+                print("Follow this account? [Y/n]: ", end="", flush=True)
+                stats.candidate()
+                choice = sys.stdin.readline().strip().lower()
 
-            display = f.get("displayName") or f.get("handle") or f.get("did") or "<unknown>"
-            handle_or_did = f.get("handle") or f.get("did") or "<unknown>"
-            print("-" * 72)
-            print(f"Candidate (depth {depth+1}): {display}  (@{handle_or_did})  — follower of seed above")
-            print(f"Bio/Description: {f_text if f_text else '(no description)'}")
-            print("Follow this account? [Y/n]: ", end="", flush=True)
-            choice = sys.stdin.readline().strip().lower()
-            
-            if choice in ("", "y", "yes"):
-                # Treat as followed (even in dry-run) to allow further expansion
-                already_following.add(f_key)
-                if args.dry_run:
-                    print("[dry-run] Would follow (create record).")
-                    added += 1
-                    # Enqueue as a new seed to expand further if within depth budget
-                    if depth + 1 <= max_depth - 1:
-                        queue.append((f, depth + 1))
-                else:
-                    try:
-                        subject_did = f.get("did")
-                        if not subject_did:
-                            print("No DID for actor; cannot follow.")
-                            skipped += 1
+                if choice in ("", "y", "yes"):
+                    subject_did = f.get("did")
+                    if not subject_did:
+                        print("No DID for actor; cannot follow.")
+                        stats.no_did_skip(); skipped += 1
+                    else:
+                        session_followed.add(subject_did)
+                        if args.dry_run:
+                            print("[dry-run] Would follow (create record).")
+                            stats.followed(); added += 1
+                            if depth + 1 <= max_depth - 1 and seed_matches(f):
+                                queue.append((f, depth + 1)); stats.enqueued()
                         else:
-                            create_follow_record(service, access, did, subject_did)
-                            print("Followed.")
-                            added += 1
-                            if depth + 1 <= max_depth - 1:
-                                queue.append((f, depth + 1))
-                    except Exception as e:
-                        print(f"Failed to follow: {e}")
-                        skipped += 1
-            else:
-                skipped += 1
-                print("Skipped.")
+                            try:
+                                create_follow_record(service, access, did, subject_did)
+                                print("Followed.")
+                                stats.followed(); added += 1
+                                if depth + 1 <= max_depth - 1 and seed_matches(f):
+                                    queue.append((f, depth + 1)); stats.enqueued()
+                            except Exception as e:
+                                print(f"Failed to follow: {e}")
+                                stats.api_error(); skipped += 1
+                else:
+                    stats.declined(); skipped += 1
+                    print("Skipped.")
 
     print("\nDone.")
     print(f"New follows added this session: {added}")
@@ -557,40 +604,15 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
         print("NOTE: dry-run mode; no changes were made.")
 
 def mode_wordmap(args, service, access, did, handle):
-    """
-    Build a word frequency map from bios/descriptions across either
-    your 'following' or your 'followers' set.
-
-    - Does NOT require or use --keywords.
-    - Select source with --following or --followers (exactly one).
-    - Prints a descending list: word<TAB>count.
-    """
-    import re
-    from collections import Counter
-
-    # Validate selection: exactly one of --following / --followers
     use_following = bool(getattr(args, "wordmap_following", False))
     use_followers = bool(getattr(args, "wordmap_followers", False))
     if use_following == use_followers:
         print("Please specify exactly one of --following or --followers for wordmap mode.", file=sys.stderr)
         return
 
-    # Fetch people set
-    if use_followers:
-        print("Fetching your followers for wordmap ...")
-        people = get_followers(service, access, handle, total_limit=10**12, page_size=100, max_pages=10000)
-        src_label = "followers"
-    else:
-        print("Fetching your follows for wordmap ...")
-        people = get_all_follows(service, access, handle, total_limit=10**12, page_size=100, max_pages=10000)
-        src_label = "following"
-
-    print(f"Loaded {len(people)} accounts from {src_label}.")
-
-    # Tokenize bios/descriptions, count words (basic alnum tokens), filter stopwords and very short tokens
+    batch_size = max(1, args.limit)
     token_re = re.compile(r"[A-Za-z0-9]+")
     stopwords = {
-        # minimal stopword set; expand as needed
         "the","and","for","you","your","with","are","that","this","from","have","has","was","were","but","not","all",
         "our","about","into","out","over","under","on","in","of","to","a","an","as","by","at","it","we","they","them",
         "be","is","am","or","if","so","my","me","their","his","her","he","she","i","us","rt"
@@ -598,24 +620,32 @@ def mode_wordmap(args, service, access, did, handle):
 
     counts = Counter()
     processed = 0
-    for person in people:
-        text = combine_bio_desc(person)
-        if not text:
-            continue
-        for tok in token_re.findall(text.lower()):
-            if len(tok) < 3:
+
+    if use_followers:
+        print("Streaming your followers for wordmap ...")
+        iterator = iter_followers(service, access, handle, batch_size=batch_size, max_pages=10000)
+    else:
+        print("Streaming your follows for wordmap ...")
+        iterator = iter_follows(service, access, handle, batch_size=batch_size, max_pages=10000)
+
+    batch_idx = 0
+    for people in iterator:
+        batch_idx += 1
+        print(f"  Batch {batch_idx} (size={len(people)})")
+        for p in people:
+            text = combine_bio_desc(p)
+            if not text:
                 continue
-            if tok in stopwords:
-                continue
-            counts[tok] += 1
-        processed += 1
-        if processed % 500 == 0:
-            sys.stderr.write(".")  # progress feedback for large sets
-            sys.stderr.flush()
+            for tok in token_re.findall(text.lower()):
+                if len(tok) < 3: continue
+                if tok in stopwords: continue
+                counts[tok] += 1
+            processed += 1
+            if processed % 500 == 0:
+                sys.stderr.write("."); sys.stderr.flush()
 
     if processed >= 500:
-        sys.stderr.write("\n")
-        sys.stderr.flush()
+        sys.stderr.write("\n"); sys.stderr.flush()
 
     if not counts:
         print("No words found in bios/descriptions.")
@@ -625,34 +655,115 @@ def mode_wordmap(args, service, access, did, handle):
     for word, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f"{word}\t{cnt}")
 
+def mode_listify(args, service, access, did, handle, keywords):
+    """
+    Create a Bluesky List from accounts you ALREADY FOLLOW whose bio/description
+    contains any keyword from --keywords. The list name is the sorted, de-duplicated
+    keywords joined with '/', trimmed to 64 characters (with '/+N' overflow marker).
+    In this batched version, --limit controls the API *batch size*; we scan all follows.
+    """
+    if not keywords:
+        print("listify requires --keywords <file.txt> with one keyword per line.", file=sys.stderr)
+        return
+
+    kwset = {kw.lower() for kw in keywords if kw}
+    list_name = _build_list_name_from_keywords(keywords, max_len=64)
+    purpose = "app.bsky.graph.defs#modlist" if getattr(args, "modlist", False) else "app.bsky.graph.defs#curatelist"
+    desc = f"Auto-curated list from keywords: {', '.join(sorted(kwset))}"
+
+    # Pass 1: stream your follows and collect matches (we need counts before creating the list in dry-run)
+    print("Scanning your follows for keyword matches (streaming in batches) ...")
+    batch_size = max(1, args.limit)
+    matches = []
+    total_seen = 0
+    batch_idx = 0
+    for follows in iter_follows(service, access, handle, batch_size=batch_size, max_pages=10000):
+        batch_idx += 1
+        print(f"  Batch {batch_idx} (size={len(follows)})")
+        for p in follows:
+            total_seen += 1
+            text = (combine_bio_desc(p) or "").lower()
+            if any(k in text for k in kwset):
+                matches.append(p)
+
+            if total_seen % 500 == 0:
+                sys.stderr.write("."); sys.stderr.flush()
+    if total_seen >= 500:
+        sys.stderr.write("\n"); sys.stderr.flush()
+
+    print("=" * 72)
+    print(f"List name: {list_name}")
+    print(f"Purpose: {'moderation (modlist)' if getattr(args, 'modlist', False) else 'curation (curatelist)'}")
+    print(f"Matches to add: {len(matches)} (from {total_seen} follows reviewed)")
+
+    if args.dry_run:
+        print("[dry-run] Would create list and add these handles/DIDs:")
+        for p in matches:
+            print(" -", p.get("handle") or p.get("did"))
+        print("[dry-run] No changes were made.")
+        return
+
+    # Create the list
+    try:
+        res = create_list_record(service, access, did, name=list_name, purpose=purpose, description=desc)
+        list_uri = res.get("uri")
+        if not list_uri:
+            raise RuntimeError("List creation did not return a URI.")
+        print(f"Created list: {list_uri}")
+    except Exception as e:
+        print(f"Failed to create list: {e}")
+        return
+
+    # Add members
+    added, failed = 0, 0
+    for p in matches:
+        subject_did = p.get("did")
+        if not subject_did:
+            failed += 1
+            print(f"Skip (no DID): {p.get('handle') or '<unknown>'}")
+            continue
+        try:
+            create_listitem_record(service, access, did, list_uri, subject_did)
+            added += 1
+            if added % 50 == 0:
+                sys.stderr.write("."); sys.stderr.flush()
+        except Exception as e:
+            failed += 1
+            print(f"\nFailed to add {p.get('handle') or subject_did}: {e}")
+
+    if added >= 50:
+        sys.stderr.write("\n"); sys.stderr.flush()
+
+    print("\nDone.")
+    print(f"List: {list_name}")
+    print(f"Added: {added}")
+    print(f"Failed: {failed}")
+
 
 # ------------------------- main -------------------------
 def main():
-    ap = argparse.ArgumentParser(description="Audit / discover follows on Bluesky using keywords in bio/description.")
-    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch","wordmap"], default="following",
-                    help="Mode: 'following' (review current follows), 'searching' (discover by keyword), 'degreesearch' (followers of your keyword-matching follows).")
+    ap = argparse.ArgumentParser(description="Audit / discover follows on Bluesky (batched).")
+    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch","wordmap","listify"], default="following",
+                    help="Mode: 'following', 'searching', 'degreesearch', or 'wordmap'.")
     ap.add_argument("--creds", required=True, help="Path to file: line1=<handle>, line2=<app_password>")
     ap.add_argument("--keywords", required=False, help="(Optional) Path to newline-separated keywords (case-insensitive). Not used in 'wordmap' mode.")
     ap.add_argument("--service", default="https://bsky.social", help="PDS base URL (default: https://bsky.social)")
-    ap.add_argument("--limit", type=int, default=100, help="For following/searching: page-size/limit used in those modes.")
-    ap.add_argument("--degreelimit", type=int, default=100,
+    ap.add_argument("--limit", type=int, default=100, help="*Batch size* for API pagination in all modes.")
+    ap.add_argument("--degreelimit", type=int, default=1,
                     help="For degreesearch: maximum DEPTH (levels) to explore from your seeds (min 1).")
     ap.add_argument("--dry-run", action="store_true", help="Don’t actually change follows; just show what would happen")
-    ap.add_argument(
-        "--nodesc",
-        action="store_true",
-        help="Scan ALL follows and return only accounts with empty/missing description. In this mode, --limit is the per-page batch size."
-    )
-    # Wordmap source selection (used with -m wordmap). Exactly one must be set.
-    ap.add_argument("--following", dest="wordmap_following", action="store_true",
+    ap.add_argument("--nodesc", action="store_true", help="(following mode) Auto-review empty descriptions within each batch.")
+    ap.add_argument("--modlist", action="store_true", help="(listify) Create a moderation list (purpose=app.bsky.graph.defs#modlist) instead of a curated list (curatelist).")
+    ap.add_argument("--following", dest="wordmap_following", action="store_true", default=False,
                     help="(wordmap mode) Analyze accounts you follow.")
-    ap.add_argument("--followers", dest="wordmap_followers", action="store_true",
+    ap.add_argument("--followers", dest="wordmap_followers", action="store_true", default=False,
                     help="(wordmap mode) Analyze accounts that follow you.")
 
     args = ap.parse_args()
 
     handle, app_password = read_creds(Path(args.creds))
-    if args.keywords:
+    keywords = []
+    if args.keywords and args.mode != "wordmap":
         keywords = read_keywords(Path(args.keywords))
         if not keywords:
             print("No keywords provided; nothing to match.", file=sys.stderr)
@@ -661,34 +772,12 @@ def main():
     access, did, confirmed_handle = get_session(args.service, handle, app_password)
     print(f"OK. DID: {did}  Handle: {confirmed_handle}")
 
-    if args.nodesc:
-        # --limit is the *batch size* per page; scan ALL follows and only return no-desc accounts
-        follows = get_all_follows(
-            service=args.service,
-            access_jwt=access,
-            actor_handle=confirmed_handle,
-            total_limit=10**12,      # ignored in nodesc mode
-            page_size=max(1, args.limit),  # treat --limit as batch size
-            max_pages=10000,         # generous fuse
-            nodesc=True
-        )
-    else:
-        # --limit is the *total* number of follows to fetch
-        follows = get_all_follows(
-            service=args.service,
-            access_jwt=access,
-            actor_handle=confirmed_handle,
-            total_limit=args.limit,
-            page_size=100,           # efficient page size
-            max_pages=1000,
-            nodesc=False
-        )
-
-
     if args.mode == "following":
         mode_following(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "searching":
         mode_searching(args, args.service, access, did, confirmed_handle, keywords)
+    elif args.mode == "listify":
+        mode_listify(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "wordmap":
         mode_wordmap(args, args.service, access, did, confirmed_handle)
     else:
