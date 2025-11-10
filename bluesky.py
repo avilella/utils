@@ -7,6 +7,11 @@ from pathlib import Path
 from datetime import datetime
 from collections import deque, Counter
 import re
+from urllib.parse import quote
+import time
+import gzip
+import hashlib
+import csv
 
 """
 Bluesky follow/unfollow/search tool (batched, v3)
@@ -232,6 +237,109 @@ def create_listitem_record(service, access_jwt, my_repo, list_uri, subject_did):
         "collection": "app.bsky.graph.listitem",
         "record": record,
     }
+    return run_curl("POST", url, headers=headers, data=payload)
+
+def create_starterpack_record(service, access_jwt, my_repo, *, name, list_uri, feeds=None, description=None):
+    """
+    Create an app.bsky.graph.starterpack record that references an existing list AT-URI.
+    `feeds` is an optional list of feed AT-URIs (max 3).
+    Returns {"uri": "...", "cid": "..."} on success.
+    """
+    url = f"{service}/xrpc/com.atproto.repo.createRecord"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    rec = {
+        "name": name,
+        "list": list_uri,
+        "createdAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+    }
+    if description:
+        rec["description"] = description
+    if feeds:
+        rec["feeds"] = [{"uri": u} for u in list(feeds)[:3]]
+    payload = {
+        "repo": my_repo,
+        "collection": "app.bsky.graph.starterpack",
+        "record": rec,
+    }
+    return run_curl("POST", url, headers=headers, data=payload)
+
+
+def get_lists_for_actor(service, access_jwt, actor, limit=100, cursor=None):
+    """
+    Return (lists, cursor) for the actor using app.bsky.graph.getLists.
+    """
+    base = f"{service}/xrpc/app.bsky.graph.getLists"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    q = f"?actor={actor}&limit={max(1, int(limit))}"
+    if cursor:
+        q += f"&cursor={cursor}"
+    out = run_curl("GET", base + q, headers=headers)
+    return out.get("lists", []) or [], out.get("cursor")
+
+def find_existing_list_by_name(service, access_jwt, actor, name, max_pages=20, page_size=100):
+    """
+    Scan your lists and return the list URI whose name matches (case-insensitive).
+    """
+    cur = None
+    pages = 0
+    name_lc = (name or "").strip().lower()
+    while pages < max_pages:
+        lists, cur = get_lists_for_actor(service, access_jwt, actor, limit=page_size, cursor=cur)
+        for L in lists:
+            n = (L.get("name") or "").strip().lower()
+            if n == name_lc:
+                return L.get("uri")
+        pages += 1
+        if not cur:
+            break
+    return None
+
+def get_list_view(service, access_jwt, list_uri, limit=1):
+    """
+    Read a list view via app.bsky.graph.getList. Returns the raw object.
+    """
+    url = f"{service}/xrpc/app.bsky.graph.getList?list={quote(list_uri)}&limit={int(limit)}"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    return run_curl("GET", url, headers=headers)
+
+def wait_until_list_ready(service, access_jwt, actor_did, list_uri, expected_name=None, timeout_sec=30.0, interval_sec=0.75):
+    """
+    Poll getList and getLists until the list appears stable.
+    Conditions (any sufficient):
+      - getList returns and its 'list.uri' equals list_uri (or top-level 'uri') AND 'items' in response (possibly empty)
+      - getLists includes an entry whose uri==list_uri and (if expected_name provided) name matches.
+    """
+    start = time.time()
+    interval = max(0.25, float(interval_sec))
+    while (time.time() - start) < float(timeout_sec):
+        ok = False
+        try:
+            lv = get_list_view(service, access_jwt, list_uri, limit=1)
+            # Handle both shapes: { list: {...}, items: [...] } or { uri: ..., items: ... }
+            list_obj = lv.get("list") if isinstance(lv, dict) else None
+            uri_ok = (list_obj and list_obj.get("uri") == list_uri) or (isinstance(lv, dict) and lv.get("uri") == list_uri)
+            items_present = isinstance(lv, dict) and ("items" in lv)
+            name_ok = True
+            if expected_name and list_obj:
+                name_ok = (list_obj.get("name") or "").strip().lower() == expected_name.strip().lower()
+            if uri_ok and items_present and name_ok:
+                return True
+        except Exception:
+            pass
+        try:
+            lists, _ = get_lists_for_actor(service, access_jwt, actor_did, limit=100)
+            for L in lists:
+                if L.get("uri") == list_uri:
+                    if expected_name:
+                        if (L.get("name") or "").strip().lower() != expected_name.strip().lower():
+                            break
+                    return True
+        except Exception:
+            pass
+        time.sleep(interval)
+        interval = min(5.0, interval * 1.5)
+    return False
+
 
 # ------------------------- text helpers -------------------------
 def combine_bio_desc(obj):
@@ -250,8 +358,88 @@ def matches_any_keyword(text, keywords):
     t = " ".join(text.lower().split())
     return any(kw in t for kw in keywords)
 
+# ------------------------- Vectorize helpers -------------------------
+def _bsky_build_analyzer():
+    """
+    Build a scikit-learn analyzer that matches pdf_cluster.py's CountVectorizer
+    (unigrams/bigrams, English stopwords, token rules). This keeps the vector
+    files compatible with pdf_cluster.py's `build` step.  Requires scikit-learn.
+    """
+    try:
+        from sklearn.feature_extraction.text import CountVectorizer
+    except Exception as e:
+        raise SystemExit(
+            "The 'vectorize' mode requires scikit-learn. "
+            "Install it with:  pip install scikit-learn"
+        )
+    cv = CountVectorizer(
+        stop_words="english",
+        ngram_range=(1, 2),
+        strip_accents="unicode",
+        lowercase=True,
+        token_pattern=r"(?u)\b[A-Za-z][A-Za-z0-9\-]{2,}\b",
+    )
+    return cv.build_analyzer()
+
+def _bsky_text_to_counts(text: str, analyzer):
+    if not text:
+        return {}
+    tokens = analyzer(text)
+    return dict(Counter(tokens))
+
+def _write_vector_file(path: Path, payload: dict):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as g:
+        json.dump(payload, g, ensure_ascii=False)
+
+def get_profiles_bulk(service, access_jwt, actors, chunk=25):
+    """
+    Fetch richer actor metadata in batches using app.bsky.actor.getProfiles.
+    `actors` may be DIDs or handles. Returns { did_or_handle: profile_dict }.
+    Profile dicts typically include: followersCount, followsCount, postsCount,
+    plus avatar/banner and identity fields.
+    """
+    base = f"{service}/xrpc/app.bsky.actor.getProfiles"
+    headers = {"Authorization": f"Bearer {access_jwt}"}
+    # de-dup while preserving order (compact)
+    seen = set()
+    uniq = []
+    for a in actors:
+        if not a:
+            continue
+        if a in seen:
+            continue
+        seen.add(a)
+        uniq.append(a)
+    out_index = {}
+    step = max(1, int(chunk))
+    for i in range(0, len(uniq), step):
+        chunk_actors = uniq[i:i+step]
+        if not chunk_actors:
+            continue
+        # Build query string with repeated ?actors= entries
+        qs = "?" + "&".join(f"actors={quote(str(a))}" for a in chunk_actors)
+        try:
+            res = run_curl("GET", base + qs, headers=headers)
+        except Exception:
+            continue
+        profs = (res.get("profiles") or []) if isinstance(res, dict) else []
+        for p in profs:
+            key = p.get("did") or p.get("handle")
+            if key:
+                out_index[key] = p
+    return out_index
+
+
 # ------------------------- Modes (batched) -------------------------
 def mode_following(args, service, access, did, handle, keywords):
+    """
+    Review/manage the accounts you already follow, batch-by-batch.
+    Behavior (matching original intent):
+      - If --nodesc and an account has an empty bio/description, optionally auto-unfollow.
+      - If --keywords provided and the account matches any phrase, it is *kept* (no prompt).
+      - Otherwise, prompt to unfollow.
+    """
     print("Streaming your follows in batches ...")
     batch_size = max(1, args.limit)
     kept, reviewed_no_match, empties = 0, 0, 0
@@ -262,14 +450,15 @@ def mode_following(args, service, access, did, handle, keywords):
         print(f"\n--- Batch {batches} (size={len(follows)}) ---")
 
         if args.nodesc:
+            # Put empty-bio accounts first in the batch
             follows.sort(key=lambda f: 0 if not combine_bio_desc(f) else 1)
 
         for f in follows:
-            text = combine_bio_desc(a)
-            # Require full-phrase match for the line from --keywords (case-insensitive)
-            if not matches_any_keyword(text, [kw]):
-                continue
+            display = f.get("displayName") or f.get("handle") or f.get("did") or "<unknown>"
+            actor = f.get("handle") or f.get("did") or "<unknown>"
+            text = combine_bio_desc(f)
 
+            # Auto-handle empty descriptions if requested
             if args.nodesc and not text:
                 follow_uri = (f.get("viewer") or {}).get("following")
                 print("=" * 72)
@@ -289,7 +478,8 @@ def mode_following(args, service, access, did, handle, keywords):
                 empties += 1
                 continue
 
-            if matches_any_keyword(text, keywords):
+            # If keywords were provided and there's a match, keep without prompting
+            if keywords and matches_any_keyword(text, keywords):
                 kept += 1
                 continue
 
@@ -297,7 +487,8 @@ def mode_following(args, service, access, did, handle, keywords):
             print("=" * 72)
             print(f"{display}  (@{actor})")
             print(f"Bio/Description: {text if text else '(no description)'}")
-            print("No keyword match.")
+            if keywords:
+                print("No keyword match.")
             follow_uri = (f.get("viewer") or {}).get("following")
             if not follow_uri:
                 print("Warning: No follow record URI available (cannot auto-unfollow from here).")
@@ -655,6 +846,132 @@ def mode_wordmap(args, service, access, did, handle):
     for word, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
         print(f"{word}\t{cnt}")
 
+def mode_vectorize(args, service, access, did, handle, keywords):
+    """
+    Vectorize all accounts you FOLLOW:
+      - Optionally filter by full-phrase, case-insensitive --keywords.
+      - For each kept account, build token counts from: displayName + handle + bio/description.
+      - Write per-account vector files (*.pdfvec.json.gz) that pdf_cluster.py `build` can read.
+    """
+    outdir = Path(args.outdir or "./bsky_vectors").expanduser().resolve()
+    analyzer = _bsky_build_analyzer()
+    batch_size = max(1, args.limit)
+    meta_csv_path = Path(args.meta_csv).expanduser().resolve() if getattr(args, "meta_csv", None) else None
+    csv_writer = None
+    csv_file = None
+    if meta_csv_path:
+        meta_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = meta_csv_path.open("w", encoding="utf-8", newline="")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "did","handle","displayName","avatar","banner",
+            "followersCount","followsCount","postsCount",
+            "viewer_following","viewer_followedBy","viewer_muted","viewer_blocking",
+            "bio_len","text_len","vector_md5","vector_path"
+        ])
+
+    print(f"Streaming your follows and writing vectors to: {outdir}")
+    if keywords:
+        print(f"Keyword filter active: {len(keywords)} phrase(s)")
+
+    seen = set()
+    written = 0
+    filtered_out = 0
+    batches = 0
+
+    for follows in iter_follows(service, access, handle, batch_size=batch_size, max_pages=10000):
+        batches += 1
+        print(f"\n--- Batch {batches} (size={len(follows)}) ---")
+        # Bulk-fetch enriched profile data for this batch
+        batch_keys = [(it.get("did") or it.get("handle")) for it in follows if (it.get("did") or it.get("handle"))]
+        prof_index = get_profiles_bulk(service, access, batch_keys)
+        for p in follows:
+            key = p.get("did") or p.get("handle")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+
+            display = p.get("displayName") or ""
+            handle_str = p.get("handle") or ""
+            bio = combine_bio_desc(p) or ""
+            combined = " ".join([display, handle_str, bio]).strip()
+
+            # Optional keyword gating (full-phrase, case-insensitive)
+            if keywords and not matches_any_keyword(combined, keywords):
+                filtered_out += 1
+                continue
+
+            # Profile & viewer metadata
+            prof = prof_index.get(key, {}) if isinstance(prof_index, dict) else {}
+            avatar = prof.get("avatar") or p.get("avatar") or ""
+            banner = prof.get("banner") or p.get("banner") or ""
+            followersCount = prof.get("followersCount")
+            followsCount   = prof.get("followsCount")
+            postsCount     = prof.get("postsCount")
+            viewer = p.get("viewer") or {}
+            v_following  = bool(viewer.get("following"))
+            v_followedBy = bool(viewer.get("followedBy"))
+            v_muted      = bool(viewer.get("muted"))
+            v_blocking   = bool(viewer.get("blocking"))
+            bio_len  = len(bio)
+            text_len = len(combined)
+
+            counts = _bsky_text_to_counts(combined, analyzer)
+            # Stable "filename" for pdf_cluster build; "md5" uniquely derived from subject + text
+            filename = f"{handle_str or key}.bsky"
+            md5 = hashlib.md5((key + "\n" + combined).encode("utf-8", "ignore")).hexdigest()
+
+            payload = {
+                "version": "bsky-vec-1",
+                "ngram_range": [1, 2],
+                "stop_words": "english",
+                "strip_accents": "unicode",
+                "token_pattern": r"(?u)\b[A-Za-z][A-Za-z0-9\-]{2,}\b",
+                "filename": filename,
+                "md5": md5,
+                "token_counts": counts,
+                # Extra metadata is harmless for pdf_cluster.py, but helpful downstream
+                "meta": {
+                    "did": p.get("did", "") or key,
+                    "handle": handle_str,
+                    "displayName": display,
+                    "avatar": avatar,
+                    "banner": banner,
+                    "followersCount": followersCount,
+                    "followsCount": followsCount,
+                    "postsCount": postsCount,
+                    "viewer_following": v_following,
+                    "viewer_followedBy": v_followedBy,
+                    "viewer_muted": v_muted,
+                    "viewer_blocking": v_blocking,
+                    "bio_len": bio_len,
+                    "text_len": text_len,
+                },
+            }
+
+            vec_path = outdir / f"{filename}.pdfvec.json.gz"
+            if vec_path.exists() and not args.overwrite:
+                # Respect existing file unless --overwrite
+                continue
+            _write_vector_file(vec_path, payload)
+            if csv_writer:
+                csv_writer.writerow([
+                    (p.get("did") or key), handle_str, display, avatar, banner,
+                    followersCount, followsCount, postsCount,
+                    int(v_following), int(v_followedBy), int(v_muted), int(v_blocking),
+                    bio_len, text_len, md5, str(vec_path)
+                ])
+            written += 1
+            if written % 50 == 0:
+                sys.stderr.write("."); sys.stderr.flush()
+
+    if written >= 50:
+        sys.stderr.write("\n"); sys.stderr.flush()
+    if csv_file:
+        csv_file.close()
+        print(f"Metadata CSV written to: {meta_csv_path}")
+    print(f"\nVectorization complete. Wrote {written} file(s) to {outdir} (filtered out: {filtered_out}).")
+
 def mode_listify(args, service, access, did, handle, keywords):
     """
     Create a Bluesky List from accounts you ALREADY FOLLOW whose bio/description
@@ -703,16 +1020,47 @@ def mode_listify(args, service, access, did, handle, keywords):
         print("[dry-run] No changes were made.")
         return
 
-    # Create the list
+    # Ensure the list exists (create if missing), then wait until it's queryable
     try:
-        res = create_list_record(service, access, did, name=list_name, purpose=purpose, description=desc)
-        list_uri = res.get("uri")
-        if not list_uri:
-            raise RuntimeError("List creation did not return a URI.")
-        print(f"Created list: {list_uri}")
+        existing_uri = find_existing_list_by_name(service, access, did, list_name)
+        if existing_uri:
+            list_uri = existing_uri
+            print(f"Found existing list: {list_uri}")
+        else:
+            res = create_list_record(service, access, did, name=list_name, purpose=purpose, description=desc)
+            list_uri = res.get("uri")
+            if not list_uri:
+                raise RuntimeError("List creation did not return a URI.")
+            print(f"Created list: {list_uri}")
+
     except Exception as e:
-        print(f"Failed to create list: {e}")
+        print(f"Failed to ensure list exists: {e}")
         return
+
+    # Wait until the list is fully functional before adding members
+    print("Waiting for the list to become queryable ...")
+    ready = wait_until_list_ready(service, access, did, list_uri, expected_name=list_name, timeout_sec=45.0, interval_sec=0.75)
+    if not ready:
+        print("Warning: Timed out waiting for list readiness; proceeding to add members anyway.")
+
+    # Optional: create a Starter Pack pointing to the list (after readiness)
+    if getattr(args, "starterpack", False):
+        sp_name = getattr(args, "sp_name", None) or f"Starter: {list_name}"
+        sp_desc = getattr(args, "sp_desc", None) or f"Starter pack for {list_name} — curated from keywords; {len(matches)} members."
+        try:
+            sp = create_starterpack_record(service, access, did,
+                                           name=sp_name,
+                                           list_uri=list_uri,
+                                           feeds=getattr(args, "sp_feed", []) or [],
+                                           description=sp_desc)
+            sp_uri = sp.get("uri")
+            if sp_uri:
+                print(f"Created starter pack: {sp_uri}")
+            else:
+                print("Starter pack create returned no URI (unexpected).")
+        except Exception as e:
+            print(f"Failed to create starter pack: {e}")
+
 
     # Add members
     added, failed = 0, 0
@@ -723,8 +1071,12 @@ def mode_listify(args, service, access, did, handle, keywords):
             print(f"Skip (no DID): {p.get('handle') or '<unknown>'}")
             continue
         try:
-            create_listitem_record(service, access, did, list_uri, subject_did)
-            added += 1
+            res_item = create_listitem_record(service, access, did, list_uri, subject_did)
+            if isinstance(res_item, dict) and res_item.get("uri"):
+                added += 1
+            else:
+                failed += 1
+                print(f"\nServer did not return a URI for {p.get('handle') or subject_did}; treating as failed.")
             if added % 50 == 0:
                 sys.stderr.write("."); sys.stderr.flush()
         except Exception as e:
@@ -743,7 +1095,7 @@ def mode_listify(args, service, access, did, handle, keywords):
 # ------------------------- main -------------------------
 def main():
     ap = argparse.ArgumentParser(description="Audit / discover follows on Bluesky (batched).")
-    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch","wordmap","listify"], default="following",
+    ap.add_argument("-m", "--mode", choices=["following","searching","degreesearch","wordmap","listify","vectorize"], default="following",
                     help="Mode: 'following', 'searching', 'degreesearch', or 'wordmap'.")
     ap.add_argument("--creds", required=True, help="Path to file: line1=<handle>, line2=<app_password>")
     ap.add_argument("--keywords", required=False, help="(Optional) Path to newline-separated keywords (case-insensitive). Not used in 'wordmap' mode.")
@@ -754,6 +1106,21 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="Don’t actually change follows; just show what would happen")
     ap.add_argument("--nodesc", action="store_true", help="(following mode) Auto-review empty descriptions within each batch.")
     ap.add_argument("--modlist", action="store_true", help="(listify) Create a moderation list (purpose=app.bsky.graph.defs#modlist) instead of a curated list (curatelist).")
+    ap.add_argument("--starterpack", action="store_true",
+                    help="(listify) After creating the list, also create a starter pack that points to it.")
+    ap.add_argument("--sp-name", default=None,
+                    help="(listify + --starterpack) Starter pack name. Default: 'Starter: <list-name>'")
+    ap.add_argument("--sp-desc", default=None,
+                    help="(listify + --starterpack) Optional description for the starter pack.")
+    ap.add_argument("--sp-feed", action="append", default=[],
+                    help="(listify + --starterpack) Feed AT-URI to include (repeatable, max 3).")
+    ap.add_argument("--outdir", default=None,
+                    help="(vectorize) Output folder for vector files (*.pdfvec.json.gz). Default: ./bsky_vectors")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="(vectorize) Overwrite existing vector files if present.")
+    ap.add_argument("--meta-csv", default=None,
+                    help="(vectorize) Optional: write one-row-per-account metadata CSV to this path.")
+
     ap.add_argument("--following", dest="wordmap_following", action="store_true", default=False,
                     help="(wordmap mode) Analyze accounts you follow.")
     ap.add_argument("--followers", dest="wordmap_followers", action="store_true", default=False,
@@ -778,6 +1145,8 @@ def main():
         mode_searching(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "listify":
         mode_listify(args, args.service, access, did, confirmed_handle, keywords)
+    elif args.mode == "vectorize":
+        mode_vectorize(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "wordmap":
         mode_wordmap(args, args.service, access, did, confirmed_handle)
     else:
