@@ -28,12 +28,21 @@ PERSONAL_KEYWORDS = [
 ]
 PERS_PATTERN = re.compile("|".join(PERSONAL_KEYWORDS), re.IGNORECASE)
 
+def clean_stream(stream):
+    """
+    Generator to intercept the file stream and strip rogue carriage returns (^M / \r)
+    that can prematurely break TSV parsing.
+    """
+    for line in stream:
+        yield line.replace('\r', ' ')
+
 def classify_account(handle, display_name, bio):
     """
     Returns 'Institutional' or 'Personal' based on keyword scoring.
-    Defaulting to 'Personal' if the score is tied, as that is the norm for social media.
+    Defaulting to 'Personal' if the score is tied.
     """
-    text_to_search = f"{handle} {display_name} {bio}".replace("\n", " ").replace("\t", " ")
+    # Scrub all newline/tab variations to ensure clean regex matching
+    text_to_search = f"{handle} {display_name} {bio}".replace("\n", " ").replace("\t", " ").replace("\r", " ")
     
     inst_score = len(INST_PATTERN.findall(text_to_search))
     pers_score = len(PERS_PATTERN.findall(text_to_search))
@@ -94,8 +103,11 @@ def main():
         with open(input_path, mode="r", encoding="utf-8") as infile, \
              open(out_path, mode="w", encoding="utf-8", newline="") as outfile:
             
+            # Wrap the input file in our cleaner to remove ^M characters on the fly
+            cleaned_infile = clean_stream(infile)
+            
             # Use TSV reader
-            reader = csv.DictReader(infile, delimiter="\t")
+            reader = csv.DictReader(cleaned_infile, delimiter="\t")
             
             if not reader.fieldnames:
                 print("Error: Input file appears to be empty or lacks headers.", file=sys.stderr)
