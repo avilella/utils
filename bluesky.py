@@ -21,7 +21,7 @@ while keeping the batched streaming structure across modes.
 
 Modes:
   - following     : review/manage the accounts you already follow
-  - searching     : discover accounts by keyword search
+  - searching     : discover accounts by keyword search (supports TSV export)
   - degreesearch  : breadth-first exploration across followers of matching seeds
   - wordmap       : build a word frequency map from bios/descriptions (followers or following)
 
@@ -83,6 +83,7 @@ def get_session(service, identifier, password):
     return access, did, handle
 
 # ------------------------- Pagination helpers (generators) -------------------------
+# ------------------------- Pagination helpers (generators) -------------------------
 def iter_follows(service, access_jwt, actor_handle, batch_size=100, max_pages=1000):
     """
     Yield lists of follows (accounts you follow) in batches of size `batch_size`.
@@ -92,9 +93,9 @@ def iter_follows(service, access_jwt, actor_handle, batch_size=100, max_pages=10
     cursor = None
     pages = 0
     while pages < max_pages:
-        q = f"?actor={actor_handle}&limit={max(1, int(batch_size))}"
+        q = f"?actor={quote(actor_handle)}&limit={max(1, int(batch_size))}"
         if cursor:
-            q += f"&cursor={cursor}"
+            q += f"&cursor={quote(cursor)}"
         out = run_curl("GET", base_url + q, headers=headers)
         batch = out.get("follows", []) or []
         if not batch:
@@ -115,9 +116,9 @@ def iter_followers(service, access_jwt, actor, batch_size=100, max_pages=1000):
     cursor = None
     pages = 0
     while pages < max_pages:
-        q = f"?actor={actor}&limit={max(1, int(batch_size))}"
+        q = f"?actor={quote(actor)}&limit={max(1, int(batch_size))}"
         if cursor:
-            q += f"&cursor={cursor}"
+            q += f"&cursor={quote(cursor)}"
         out = run_curl("GET", base_url + q, headers=headers)
         batch = out.get("followers", []) or []
         if not batch:
@@ -138,9 +139,9 @@ def iter_search_actors(service, access_jwt, keyword, batch_size=50, max_pages=5)
     cursor = None
     pages = 0
     while pages < max_pages:
-        q = f"?q={keyword}&limit={max(1, int(batch_size))}"
+        q = f"?q={quote(keyword)}&limit={max(1, int(batch_size))}"
         if cursor:
-            q += f"&cursor={cursor}"
+            q += f"&cursor={quote(cursor)}"
         out = run_curl("GET", base_url + q, headers=headers)
         batch = out.get("actors", []) or []
         if not batch:
@@ -198,7 +199,7 @@ def _build_list_name_from_keywords(keywords, max_len=64):
     pieces, used = [], 0
     for t in toks:
         sep = "/" if pieces else ""
-        if used + len(sep) + len(t) > max_len - 4:  # reserve 4 chars for '/+N'
+        if used + len(sep) + len(t) > max_len - 4:
             break
         pieces.append(t)
         used += len(sep) + len(t)
@@ -518,72 +519,109 @@ def mode_following(args, service, access, did, handle, keywords):
     if args.dry_run:
         print("NOTE: dry-run mode; no changes were made.")
 
-def mode_searching(args, service, access, did, handle, keywords):
+
+def mode_searching(args, service, access, did, handle, keywords, neg_keywords=None, export_file=None):
     if not keywords:
         print("No keywords provided; nothing to search.", file=sys.stderr)
         return
 
+    neg_keywords = neg_keywords or []
     print(f"Searching for users by {len(keywords)} keyword(s) in batches of {args.limit} ...")
+    if neg_keywords:
+        print(f"Applying {len(neg_keywords)} negative keyword(s) filter ...")
+
     seen = set()
     session_followed = set()
     added, skipped = 0, 0
     batch_size = max(1, args.limit)
 
-    for kw in keywords:
-        pages = 0
-        for page in iter_search_actors(service, access, kw, batch_size=min(50, batch_size),
-                                       max_pages=max(1, (batch_size + 49)//50)):
-            pages += 1
-            print(f"\n--- Keyword '{kw}' — page {pages}, {len(page)} results ---")
-            for a in page:
-                key = a.get("did") or a.get("handle")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
+    tsv_out = None
+    if export_file:
+        tsv_out = open(export_file, "w", encoding="utf-8")
+        tsv_out.write("DID\tHandle\tDisplayName\tBio\n")
+        print(f"Export mode active: Matches will be saved to '{export_file}' without prompting.")
 
-                text = combine_bio_desc(a)
-                if kw not in (text.lower() if text else ""):
-                    continue
-
-                if (a.get("viewer") or {}).get("following") or key in session_followed:
-                    continue
-
-                display = a.get("displayName") or a.get("handle") or a.get("did") or "<unknown>"
-                handle_or_did = a.get("handle") or a.get("did") or "<unknown>"
-
-                print("=" * 72)
-                print(f"{display}  (@{handle_or_did})")
-                print(f"Bio/Description: {text if text else '(no description)'}")
-                print(f"Matched keyword: {kw}")
-                print("Follow this account? [y/N]: ", end="", flush=True)
-                choice = sys.stdin.readline().strip().lower()
-                if choice == "y":
-                    subject_did = a.get("did")
-                    if not subject_did:
-                        print("No DID for actor; cannot follow.")
-                        skipped += 1
+    try:
+        for kw in keywords:
+            pages = 0
+            for page in iter_search_actors(service, access, kw, batch_size=min(50, batch_size),
+                                           max_pages=max(1, (batch_size + 49)//50)):
+                pages += 1
+                print(f"\n--- Keyword '{kw}' — page {pages}, {len(page)} results ---")
+                for a in page:
+                    key = a.get("did") or a.get("handle")
+                    if not key or key in seen:
                         continue
-                    session_followed.add(subject_did)
-                    if args.dry_run:
-                        print("[dry-run] Would follow (create record).")
+                    seen.add(key)
+
+                    text = combine_bio_desc(a)
+                    t_lower = text.lower() if text else ""
+
+                    # Require positive keyword match
+                    if kw not in t_lower:
+                        continue
+
+                    # Reject if any negative keyword is found
+                    if neg_keywords and any(nk in t_lower for nk in neg_keywords):
+                        continue
+
+                    if (a.get("viewer") or {}).get("following") or key in session_followed:
+                        continue
+
+                    display = a.get("displayName") or a.get("handle") or a.get("did") or "<unknown>"
+                    handle_or_did = a.get("handle") or a.get("did") or "<unknown>"
+
+                    # If export mode is toggled, write TSV and skip prompt
+                    if tsv_out:
+                        p_did = a.get("did", "")
+                        p_display = display.replace("\t", " ").replace("\n", " ")
+                        p_bio = text.replace("\t", " ").replace("\n", " ")
+                        tsv_out.write(f"{p_did}\t{handle_or_did}\t{p_display}\t{p_bio}\n")
                         added += 1
-                    else:
-                        try:
-                            create_follow_record(service, access, did, subject_did)
-                            print("Followed.")
-                            added += 1
-                        except Exception as e:
-                            print(f"Failed to follow: {e}")
+                        continue
+
+                    # Regular prompt logic
+                    print("=" * 72)
+                    print(f"{display}  (@{handle_or_did})")
+                    print(f"Bio/Description: {text if text else '(no description)'}")
+                    print(f"Matched keyword: {kw}")
+                    print("Follow this account? [y/N]: ", end="", flush=True)
+                    choice = sys.stdin.readline().strip().lower()
+                    if choice == "y":
+                        subject_did = a.get("did")
+                        if not subject_did:
+                            print("No DID for actor; cannot follow.")
                             skipped += 1
-                else:
-                    skipped += 1
-                    print("Skipped.")
+                            continue
+                        session_followed.add(subject_did)
+                        if args.dry_run:
+                            print("[dry-run] Would follow (create record).")
+                            added += 1
+                        else:
+                            try:
+                                create_follow_record(service, access, did, subject_did)
+                                print("Followed.")
+                                added += 1
+                            except Exception as e:
+                                print(f"Failed to follow: {e}")
+                                skipped += 1
+                    else:
+                        skipped += 1
+                        print("Skipped.")
+
+    finally:
+        if tsv_out:
+            tsv_out.close()
 
     print("\nDone.")
-    print(f"Followed new accounts: {added}")
-    print(f"Skipped: {skipped}")
-    if args.dry_run:
+    if export_file:
+        print(f"Exported {added} matching accounts to {export_file}")
+    else:
+        print(f"Followed new accounts: {added}")
+        print(f"Skipped: {skipped}")
+    if args.dry_run and not export_file:
         print("NOTE: dry-run mode; no changes were made.")
+
 
 def mode_degreesearch(args, service, access, did, handle, keywords):
     """
@@ -600,10 +638,7 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
 
     max_depth = max(1, int(args.degreelimit))
     batch_size = max(1, args.limit)
-
     print(f"Exploring up to depth (--degreelimit) = {max_depth}. Batch size (--limit) = {batch_size}.")
-
-    # Stats that report every 100 follower-accounts processed
     STATS_BATCH_N = 100
 
     class Stats:
@@ -611,33 +646,27 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
             self.n = n
             self.cum = Counter()
             self.block = Counter()
-
         def _b(self, k, inc=1):
             self.block[k] = self.block.get(k, 0) + inc
             self.cum[k] = self.cum.get(k, 0) + inc
-
         def account_seen(self):
             self._b("followers_iterated", 1)
             if self.block.get("followers_iterated", 0) >= self.n:
                 self.report_block()
                 self.block = Counter()
-
         def seed_seen(self): self._b("seeds_seen", 1)
         def seed_matched(self): self._b("seeds_matched", 1)
-
         def no_key_skip(self): self._b("no_key_skip", 1)
         def self_skip(self): self._b("self_skip", 1)
         def already_following_skip(self): self._b("already_following_skip", 1)
         def dedup_skip(self): self._b("dedup_skip", 1)
         def keyword_miss(self): self._b("keyword_miss", 1)
-
         def candidate(self): self._b("candidates_considered", 1); self._b("prompted", 1)
         def followed(self): self._b("followed_added", 1)
         def declined(self): self._b("user_declined", 1)
         def no_did_skip(self): self._b("no_did_skip", 1)
         def api_error(self): self._b("api_error", 1)
         def enqueued(self): self._b("enqueued_new_seeds", 1)
-
         def _format(self, d):
             skipped = d.get("keyword_miss",0)+d.get("already_following_skip",0)+d.get("dedup_skip",0)+d.get("self_skip",0)+d.get("no_key_skip",0)
             lines = [
@@ -648,7 +677,6 @@ def mode_degreesearch(args, service, access, did, handle, keywords):
                 f"  Seeds: seen={d.get('seeds_seen',0)}, matched={d.get('seeds_matched',0)}",
             ]
             return '\n'.join(lines)
-
         def report_block(self):
             sys.stderr.write('\n[degreesearch] Stats for last %d accounts:\n' % self.n)
             sys.stderr.write(self._format(self.block) + '\n')
@@ -1099,6 +1127,11 @@ def main():
                     help="Mode: 'following', 'searching', 'degreesearch', or 'wordmap'.")
     ap.add_argument("--creds", required=True, help="Path to file: line1=<handle>, line2=<app_password>")
     ap.add_argument("--keywords", required=False, help="(Optional) Path to newline-separated keywords (case-insensitive). Not used in 'wordmap' mode.")
+    
+    # NEW ARGUMENTS ADDED HERE:
+    ap.add_argument("--neg-keywords", required=False, help="(Optional) Path to newline-separated negative keywords to strictly exclude.")
+    ap.add_argument("--export", default=None, help="(searching mode) Export matching accounts to this TSV file instead of prompting to follow.")
+    
     ap.add_argument("--service", default="https://bsky.social", help="PDS base URL (default: https://bsky.social)")
     ap.add_argument("--limit", type=int, default=100, help="*Batch size* for API pagination in all modes.")
     ap.add_argument("--degreelimit", type=int, default=1,
@@ -1129,11 +1162,17 @@ def main():
     args = ap.parse_args()
 
     handle, app_password = read_creds(Path(args.creds))
+    
     keywords = []
     if args.keywords and args.mode != "wordmap":
         keywords = read_keywords(Path(args.keywords))
         if not keywords:
             print("No keywords provided; nothing to match.", file=sys.stderr)
+            
+    # Parse negative keywords if provided
+    neg_keywords = []
+    if args.neg_keywords:
+        neg_keywords = read_keywords(Path(args.neg_keywords))
 
     print(f"Logging in as {handle} @ {args.service} ...")
     access, did, confirmed_handle = get_session(args.service, handle, app_password)
@@ -1142,7 +1181,7 @@ def main():
     if args.mode == "following":
         mode_following(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "searching":
-        mode_searching(args, args.service, access, did, confirmed_handle, keywords)
+        mode_searching(args, args.service, access, did, confirmed_handle, keywords, neg_keywords, args.export)
     elif args.mode == "listify":
         mode_listify(args, args.service, access, did, confirmed_handle, keywords)
     elif args.mode == "vectorize":
