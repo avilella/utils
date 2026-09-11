@@ -1,0 +1,1 @@
+find $PWD -type f -printf "%TF %TT  %10s  %p\n" | sort -r
